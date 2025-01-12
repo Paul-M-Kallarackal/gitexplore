@@ -1,0 +1,1 @@
+export const connection: string = "my-dgraph"
