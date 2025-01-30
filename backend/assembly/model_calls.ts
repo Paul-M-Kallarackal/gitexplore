@@ -16,8 +16,6 @@ export function generateText(instruction: string, prompt: string): string {
       new SystemMessage(instruction),
       new UserMessage(prompt),
     ])
-    input.temperature = 0.7
-    input.maxTokens = 500
     const output = model.invoke(input)
     return output.choices[0].message.content.trim()
 }

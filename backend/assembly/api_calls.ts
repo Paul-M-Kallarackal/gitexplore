@@ -14,19 +14,19 @@ import { JSON } from "json-as";
     full_name: string = "";
   }
 
+@json class GitIngestContent {
+  summary: string = "";
+  tree: string = "";
+  content: string = "";
+}
+
   export class ConnectionsData {
     followers: GithubUser[] = []
     following: GithubUser[] = []
     repositories: Repo[] = []
     starredRepositories: Repo[] = []
   }
-  
-  @json export class GitIngestContent {
-    input_text: string = "";
-    max_file_size: string = "";
-    pattern_type: string = "";
-    pattern: string = "";
-  }
+
   export class Followers {
     followers: GithubUser[] = []
   }
@@ -67,7 +67,8 @@ export function getContext(url:string): string {
       console.log(response.statusText);
     }
 
-    console.log(response.json<string>())
-    return response.json<string>()
+  console.log(response.json<string>())
+  const jsonResponse = JSON.parse<GitIngestContent>(response.json<string>())
+  return jsonResponse.content
   }
 
