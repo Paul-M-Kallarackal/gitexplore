@@ -62,11 +62,25 @@
     },
     {
       "source": "/login",
-      "destination": { "service": "web", "path": "/index.html" }
+      "destination": { "service": "web" },
+      "transforms": [
+        {
+          "type": "request.path",
+          "op": "set",
+          "args": "/index.html"
+        }
+      ]
     },
     {
       "source": "/app/(.*)",
-      "destination": { "service": "web", "path": "/index.html" }
+      "destination": { "service": "web" },
+      "transforms": [
+        {
+          "type": "request.path",
+          "op": "set",
+          "args": "/index.html"
+        }
+      ]
     },
     {
       "source": "/(.*)",

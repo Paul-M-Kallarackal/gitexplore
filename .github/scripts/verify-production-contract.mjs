@@ -89,9 +89,15 @@ for (const route of ['/login', '/app/(.*)']) {
       (rewrite) =>
         rewrite.source === route &&
         rewrite.destination?.service === 'web' &&
-        rewrite.destination.path === '/index.html'
+        rewrite.destination.path === undefined &&
+        rewrite.transforms?.some(
+          (transform) =>
+            transform.type === 'request.path' &&
+            transform.op === 'set' &&
+            transform.args === '/index.html'
+        )
     ),
-    `Vercel SPA entry rewrite missing for ${route}`
+    `Vercel SPA request-path transform missing for ${route}`
   );
 }
 for (const header of [
