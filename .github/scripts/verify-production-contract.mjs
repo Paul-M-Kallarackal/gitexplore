@@ -83,6 +83,17 @@ for (const route of ['/auth/(.*)', '/graphql', '/health']) {
     `Vercel API rewrite missing for ${route}`
   );
 }
+for (const route of ['/login', '/app/(.*)']) {
+  requireContract(
+    vercel.rewrites?.some(
+      (rewrite) =>
+        rewrite.source === route &&
+        rewrite.destination?.service === 'web' &&
+        rewrite.destination.path === '/index.html'
+    ),
+    `Vercel SPA entry rewrite missing for ${route}`
+  );
+}
 for (const header of [
   'Content-Security-Policy',
   'Strict-Transport-Security',
