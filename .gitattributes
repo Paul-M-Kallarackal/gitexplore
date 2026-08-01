@@ -1,0 +1,4 @@
+* text=auto
+
+# Migration checksums are byte-for-byte release contracts across Windows and Linux.
+docker/neo4j/init/*.cypher text eol=lf

@@ -1,0 +1,197 @@
+/*
+ * Strawn 0.1.0 semantic token contract.
+ * Canonical source: C:\Users\loqpm\Desktop\Paul\strawn\packages\strawn\src\theme.ts
+ *
+ * GitExplore is a Svelte product, so it consumes Strawn's framework-neutral
+ * CSS contract while keeping product-specific components in this package.
+ */
+:root {
+  color-scheme: light;
+
+  --background: #fbf9fd;
+  --foreground: #241b2b;
+  --card: #ffffff;
+  --card-foreground: #241b2b;
+  --popover: #ffffff;
+  --popover-foreground: #241b2b;
+  --primary: #765092;
+  --primary-foreground: #ffffff;
+  --secondary: #f4eef8;
+  --secondary-foreground: #4d3262;
+  --muted: #f4eef8;
+  --muted-foreground: #716579;
+  --accent: #eadcf4;
+  --accent-foreground: #4d3262;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-inset: #f7f3f9;
+  --inverse: #241b2b;
+  --inverse-foreground: #f8f4fb;
+  --success: #16794f;
+  --success-foreground: #ffffff;
+  --success-muted: #e9f7ef;
+  --success-muted-foreground: #0d5b3a;
+  --warning: #8a5b00;
+  --warning-foreground: #ffffff;
+  --warning-muted: #fff5d6;
+  --warning-muted-foreground: #5d4100;
+  --info: #315fbd;
+  --info-foreground: #ffffff;
+  --info-muted: #edf3ff;
+  --info-muted-foreground: #23498f;
+  --destructive: #b42318;
+  --destructive-foreground: #ffffff;
+  --destructive-muted: #fff0ef;
+  --destructive-muted-foreground: #8f1d14;
+  --border: #e4d9ea;
+  --border-strong: #d8c8e1;
+  --input: #d8c8e1;
+  --ring: #8c68a5;
+
+  --font-ui: "Geist Variable", "Geist", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body: var(--font-ui);
+  --font-heading: var(--font-ui);
+  --font-mono: "Geist Mono Variable", "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-display: var(--font-heading);
+  --font-default: var(--font-ui);
+
+  --type-size-xs: 0.75rem;
+  --type-size-sm: 0.875rem;
+  --type-size-md: 1rem;
+  --type-size-lg: 1.125rem;
+  --type-size-xl: 1.375rem;
+  --type-size-2xl: 1.75rem;
+  --type-size-3xl: 2.25rem;
+  --type-size-4xl: clamp(2.75rem, 6vw, 5.5rem);
+  --type-size-heading: clamp(3.25rem, 8vw, 7.5rem);
+  --type-leading-tight: 1.02;
+  --type-leading-heading: 1.12;
+  --type-leading-ui: 1.3;
+  --type-leading-body: 1.55;
+  --type-leading-relaxed: 1.75;
+  --type-tracking-tight: -0.035em;
+  --type-tracking-heading: -0.02em;
+  --type-tracking-normal: 0;
+  --type-tracking-caps: 0.09em;
+  --type-weight-regular: 400;
+  --type-weight-medium: 500;
+  --type-weight-semibold: 600;
+  --type-weight-bold: 700;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-7: 1.75rem;
+  --space-8: 2rem;
+  --space-9: 2.25rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-14: 3.5rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+  --space-24: 6rem;
+  --space-32: 8rem;
+
+  --size-container: 72rem;
+  --size-container-wide: 88rem;
+  --size-reading: 42rem;
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-2xl: 32px;
+  --radius-pill: 9999px;
+
+  --shadow-hairline: 0 0 0 1px rgba(36, 27, 43, 0.06);
+  --shadow-soft: 0 0 0 1px rgba(36, 27, 43, 0.055), 0 2px 8px rgba(36, 27, 43, 0.04);
+  --shadow-card: 0 4px 24px rgba(76, 49, 94, 0.06);
+  --shadow-elevated: 0 20px 60px rgba(76, 49, 94, 0.12);
+  --shadow-focus: 0 0 0 3px color-mix(in srgb, var(--ring) 28%, transparent);
+
+  --control-height-compact: 2rem;
+  --control-height-default: 2.75rem;
+  --control-height-comfortable: 3.25rem;
+  --control-hit-target: 2.75rem;
+
+  --layer-base: 0;
+  --layer-sticky: 20;
+  --layer-header: 30;
+  --layer-dropdown: 40;
+  --layer-overlay: 50;
+  --layer-modal: 60;
+  --layer-toast: 70;
+  --layer-tooltip: 80;
+
+  --effect-scrim: rgba(36, 27, 43, 0.42);
+  --effect-scrim-strong: rgba(36, 27, 43, 0.62);
+  --effect-image-outline: rgba(0, 0, 0, 0.1);
+  --effect-disabled-opacity: 0.48;
+  --border-weight-subtle: 1px;
+  --border-weight-strong: 2px;
+  --motion-duration-immediate: 80ms;
+  --motion-duration-fast: 150ms;
+  --motion-duration-base: 250ms;
+  --motion-duration-slow: 400ms;
+  --motion-duration-deliberate: 500ms;
+  --motion-ease-enter: cubic-bezier(0.22, 1, 0.36, 1);
+  --motion-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --motion-ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --motion-ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --motion-scale-press: 0.96;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-color-mode="light"]) {
+    color-scheme: dark;
+    --background: #18141d;
+    --foreground: #f8f4fb;
+    --card: #211b27;
+    --card-foreground: #f8f4fb;
+    --popover: #28202f;
+    --popover-foreground: #f8f4fb;
+    --primary: #c6a4da;
+    --primary-foreground: #241b2b;
+    --secondary: #2c2433;
+    --secondary-foreground: #f0e8f5;
+    --muted: #2c2433;
+    --muted-foreground: #c3b8ca;
+    --accent: #3a2d43;
+    --accent-foreground: #f8f4fb;
+    --surface: #211b27;
+    --surface-raised: #28202f;
+    --surface-inset: #18141d;
+    --inverse: #f8f4fb;
+    --inverse-foreground: #241b2b;
+    --success: #6fd6a4;
+    --success-foreground: #08291a;
+    --success-muted: #173728;
+    --success-muted-foreground: #9ce8c3;
+    --warning: #f5c45a;
+    --warning-foreground: #332300;
+    --warning-muted: #3b3018;
+    --warning-muted-foreground: #f7d98e;
+    --info: #91b4ff;
+    --info-foreground: #132347;
+    --info-muted: #1d2d50;
+    --info-muted-foreground: #b9ceff;
+    --destructive: #ff9b91;
+    --destructive-foreground: #3d1917;
+    --destructive-muted: #452220;
+    --destructive-muted-foreground: #ffc1bb;
+    --border: #403548;
+    --border-strong: #4c4055;
+    --input: #4c4055;
+    --ring: #c6a4da;
+    --effect-scrim: rgba(8, 6, 10, 0.58);
+    --effect-scrim-strong: rgba(8, 6, 10, 0.76);
+    --effect-image-outline: rgba(255, 255, 255, 0.1);
+    --shadow-hairline: 0 0 0 1px rgba(255, 255, 255, 0.08);
+    --shadow-soft: 0 0 0 1px rgba(255, 255, 255, 0.07), 0 2px 8px rgba(0, 0, 0, 0.2);
+    --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.2);
+    --shadow-elevated: 0 20px 60px rgba(0, 0, 0, 0.32);
+  }
+}
