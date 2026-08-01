@@ -24,6 +24,13 @@ Vercel supplies `PORT` to the Rust container. `AppConfig` binds `0.0.0.0:<PORT>`
 
 `Dockerfile.vercel` also fixes `GITEXPLORE_DEPLOYMENT_MODE=production` and `GITEXPLORE_GRAPH_BACKEND=neo4j`. Production startup fails closed unless the frontend origin is HTTPS, the exact OAuth callback and credentials exist, the Neo4j URI is encrypted, identity encryption is configured, and both database capacity limits exist. The static web bundle contains no API host; browser requests remain on the incoming origin.
 
+The protected release workflow builds the Rust release binary once on the pinned
+`ubuntu-22.04` runner, uses that same binary for the Aura schema gate, and hands
+it to `Dockerfile.vercel`. The Docker build executes the binary in both its
+Bookworm build and runtime stages before deployment, so an ABI mismatch fails
+before the artifact can ship. When the handoff file is absent, local
+`docker build` commands keep using the self-contained Rust builder path.
+
 ## Fail-closed production blockers
 
 The runtime no longer depends on a writable container filesystem: Neo4j stores encrypted GitHub connections, pending OAuth state, sessions, graph data, fenced entity refresh leases, and per-GitHub-identity REST budget state/leases. The budget properties live on the already-constrained `GitHubIdentity` node, so the immutable version-1 schema migration does not change. The embedded schema has an idempotent release migration and read-only startup check. The Aura instance, rotated credentials, Vercel/GitHub secret configuration, GitHub OAuth application, scoped DNS record, build, and local verification gates are provisioned and passing.

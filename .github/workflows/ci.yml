@@ -11,9 +11,40 @@ permissions:
   contents: read
 
 jobs:
-  verify:
-    name: Rust and browser checks
+  changes:
+    name: Detect production image changes
     runs-on: ubuntu-latest
+    outputs:
+      production_api: ${{ steps.filter.outputs.production_api }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect production API image inputs
+        id: filter
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          if git diff --quiet "$BASE_SHA" HEAD -- \
+            .github/workflows/ci.yml \
+            .github/workflows/release.yml \
+            .dockerignore \
+            .gitexplore-release \
+            Dockerfile.vercel \
+            Cargo.toml \
+            Cargo.lock \
+            rust-toolchain.toml \
+            src \
+            docker/neo4j/init; then
+            echo "production_api=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "production_api=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  quality:
+    name: Core Rust and browser checks
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
@@ -38,7 +69,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: ubuntu-22.04-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
@@ -55,7 +86,6 @@ jobs:
       - name: Verify browser packages
         run: |
           pnpm --filter @gitexplore/api-client test
-          pnpm --filter @gitexplore/web check
           pnpm --filter @gitexplore/web test
           pnpm check
 
@@ -64,14 +94,55 @@ jobs:
           pnpm production:check
           pnpm --filter @gitexplore/web build
 
-      - uses: docker/setup-buildx-action@v3
+  production_image:
+    name: Production API image
+    needs: changes
+    if: needs.changes.outputs.production_api == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore pinned Linux Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/1.91.0-x86_64-unknown-linux-gnu
+            ~/.rustup/update-hashes/1.91.0-x86_64-unknown-linux-gnu
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-22.04-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
+
+      - name: Build verified Linux release binary
+        run: |
+          cargo build --locked --release
+          install -Dm755 target/release/gitexplore .gitexplore-release/gitexplore
 
       - name: Verify production API image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.vercel
-          push: false
-          tags: gitexplore-api:verify
-          cache-from: type=gha,scope=gitexplore-api
-          cache-to: type=gha,mode=max,scope=gitexplore-api
+        run: docker build --file Dockerfile.vercel --tag gitexplore-api:verify .
+
+      - name: Boot production API image
+        run: docker run --rm gitexplore-api:verify gitexplore --help
+
+  verify:
+    name: Rust and browser checks
+    if: always()
+    needs: [changes, quality, production_image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every applicable gate
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          IMAGE_RESULT: ${{ needs.production_image.result }}
+        run: |
+          test "$CHANGES_RESULT" = "success"
+          test "$QUALITY_RESULT" = "success"
+          test "$IMAGE_RESULT" = "success" || test "$IMAGE_RESULT" = "skipped"

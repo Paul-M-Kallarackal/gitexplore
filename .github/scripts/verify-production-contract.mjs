@@ -12,6 +12,7 @@ const manifest = json('ribbon.json');
 const workspace = json('package.json');
 const vercel = json('vercel.json');
 const dockerfile = read('Dockerfile.vercel');
+const ci = read('.github/workflows/ci.yml');
 const release = read('.github/workflows/release.yml');
 const schema = read('docker/neo4j/init/01-schema.cypher').replace(/\r\n/g, '\n');
 
@@ -142,6 +143,22 @@ for (const fragment of [
   requireContract(dockerfile.includes(fragment), `Dockerfile.vercel must contain: ${fragment}`);
 }
 requireContract(!dockerfile.includes('RUN --mount='), 'Production Dockerfile must work without BuildKit-only RUN mounts');
+requireContract(
+  dockerfile.includes('.gitexplore-release/gitexplore') &&
+    dockerfile.includes('/tmp/gitexplore --help'),
+  'Production Dockerfile must validate the optional CI-built Linux binary'
+);
+for (const [workflow, contents] of [
+  ['CI', ci],
+  ['release', release],
+]) {
+  requireContract(
+    contents.includes('runs-on: ubuntu-22.04') &&
+      contents.includes('ubuntu-22.04-${{ runner.arch }}-rust-1.91.0-') &&
+      contents.includes('install -Dm755 target/release/gitexplore .gitexplore-release/gitexplore'),
+    `${workflow} must build the production binary on the pinned ABI-compatible runner`
+  );
+}
 
 const requiredServerEnv = [
   'GITEXPLORE_DEPLOYMENT_MODE',

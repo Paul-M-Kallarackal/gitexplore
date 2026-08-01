@@ -6,9 +6,15 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 COPY docker/neo4j/init ./docker/neo4j/init
+COPY .gitexplore-release ./.gitexplore-release
 
-RUN cargo build --locked --release \
-    && cp /workspace/target/release/gitexplore /tmp/gitexplore
+RUN if [ -f /workspace/.gitexplore-release/gitexplore ]; then \
+        install -m 0755 /workspace/.gitexplore-release/gitexplore /tmp/gitexplore; \
+        /tmp/gitexplore --help >/dev/null; \
+    else \
+        cargo build --locked --release; \
+        cp /workspace/target/release/gitexplore /tmp/gitexplore; \
+    fi
 
 FROM debian:bookworm-slim AS runtime
 
@@ -20,6 +26,8 @@ RUN apt-get update \
     && install -d -o gitexplore -g gitexplore /tmp/gitexplore
 
 COPY --from=builder --chown=gitexplore:gitexplore /tmp/gitexplore /usr/local/bin/gitexplore
+
+RUN gitexplore --help >/dev/null
 
 ENV PORT=80 \
     GITEXPLORE_DEPLOYMENT_MODE=production \

@@ -9,3 +9,4 @@ apps/web/dist/
 apps/web/.vercel/
 .vercel/
 .gitexplore-*.png
+.gitexplore-release/gitexplore

@@ -14,7 +14,7 @@ permissions:
 jobs:
   deploy:
     name: Verify and deploy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     environment: production
     env:
@@ -40,7 +40,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          # Main releases seed both debug and release artifacts for future PR jobs.
+          key: ubuntu-22.04-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
@@ -96,8 +97,10 @@ jobs:
 
       - name: Apply and verify Neo4j Aura schema
         run: |
-          cargo run --locked --release -- --format json schema apply
-          cargo run --locked --release -- --format json schema check
+          cargo build --locked --release
+          target/release/gitexplore --format json schema apply
+          target/release/gitexplore --format json schema check
+          install -Dm755 target/release/gitexplore .gitexplore-release/gitexplore
         env:
           GITEXPLORE_GRAPH_BACKEND: neo4j
           GITEXPLORE_IDENTITY_ENCRYPTION_KEY: ${{ secrets.GITEXPLORE_IDENTITY_ENCRYPTION_KEY }}
