@@ -27,8 +27,17 @@ export function expeditionStage(depth: number) {
   };
 }
 
-export function ExpeditionProgress({ trailDepth, repositoryCount }: { trailDepth: number; repositoryCount: number }) {
-  const stage = expeditionStage(trailDepth);
+export function ExpeditionProgress({
+  currentTrailDepth,
+  earnedTrailDepth,
+  repositoryCount,
+}: {
+  currentTrailDepth: number;
+  earnedTrailDepth: number;
+  repositoryCount: number;
+}) {
+  const deepestTrail = Math.max(0, Math.floor(earnedTrailDepth));
+  const stage = expeditionStage(deepestTrail);
   const progressLabel = stage.next
     ? `${stage.progress} of ${stage.progressMaximum} connections toward ${stage.next.name}`
     : 'Cartographer rank reached';
@@ -42,7 +51,7 @@ export function ExpeditionProgress({ trailDepth, repositoryCount }: { trailDepth
             <Heading id="expedition-progress-title" size="h2">{stage.current.name}</Heading>
           </div>
           <Badge tone="neutral" leadingIcon={<MapPinIcon aria-hidden="true" size={14} />}>
-            {trailDepth} {trailDepth === 1 ? 'hop' : 'hops'}
+            {currentTrailDepth} {currentTrailDepth === 1 ? 'hop' : 'hops'} now
           </Badge>
         </div>
         <Text size="sm" color="$mutedForeground">
@@ -52,7 +61,8 @@ export function ExpeditionProgress({ trailDepth, repositoryCount }: { trailDepth
         </Text>
         <Progress label={progressLabel} value={stage.progress} max={stage.progressMaximum} size="sm" />
         <dl className="expedition-facts">
-          <div><dt>Current depth</dt><dd>{trailDepth}</dd></div>
+          <div><dt>Current depth</dt><dd>{currentTrailDepth}</dd></div>
+          <div><dt>Deepest trail</dt><dd>{deepestTrail}</dd></div>
           <div><dt>Repository signals here</dt><dd>{repositoryCount}</dd></div>
         </dl>
       </div>

@@ -160,6 +160,52 @@ Public graph lookups use lowercase normalized aliases, but user and repository i
 
 For each collection with complete coverage, GitExplore deletes the corresponding prior `FOLLOWS`, `STARRED`, or `OWNS` edges and inserts the current authoritative set. For each partial collection, it preserves existing edges and merges the fetched entries, avoiding destructive replacement from a capped prefix. If any collection is partial, the neighborhood remains `STALE`. Neo4j performs the complete replacements and partial merges in one transaction; a failure rolls back the entire import.
 
+### Private recent routes and progress
+
+`explorationActivity` reads only the current session owner's recent people and deepest validated route. The requested limit, from 1 through 50, caps visible restart points; bounded hidden opt-outs are also returned so an opened profile can offer **Add to recent** without losing the preference.
+
+```graphql
+query ExplorationActivity {
+  explorationActivity(limit: 50) {
+    recentPeople {
+      user { githubId login name avatarUrl }
+      trail
+      direction
+      lastViewedAt
+      visitCount
+      visible
+    }
+    maxTrailDepth
+  }
+}
+```
+
+After a neighborhood resolves, the browser records the complete current route. Every login must resolve to a shared user, every adjacent pair must have a `FOLLOWS` relationship in either direction, no person may repeat, and the final stable id must be the visited profile. Invalid URL trails therefore cannot earn expedition progress.
+
+```graphql
+mutation RecordPersonVisit {
+  recordPersonVisit(
+    login: "bob"
+    trail: ["alice", "bob"]
+    direction: FOLLOWING
+  ) {
+    maxTrailDepth
+    recentPeople { user { login } trail direction visible }
+  }
+}
+```
+
+Visibility changes are explicit and private. Automatic visits refresh the stored route and count but preserve `visible: false`; only this mutation restores the restart point:
+
+```graphql
+mutation HideRecentPerson {
+  setRecentPersonVisible(login: "bob", visible: false) {
+    recentPeople { user { login } visible }
+    maxTrailDepth
+  }
+}
+```
+
 ### Warm the discovery graph
 
 `startDiscoveryWarmup` starts one private job for the authenticated app user; it accepts no identity or seed argument. The connected GitHub login is the seed. Repeated starts return the same active job, so browser retries cannot create duplicate work. `COMPLETED` remains idempotently complete. A `RESERVE_PROTECTED` job is also returned unchanged before its recorded reset; an explicit start after that reset atomically requeues the same job id with its existing frontier and progress. A start after `FAILED` creates a new attempt.
@@ -277,7 +323,7 @@ The entry route:
 1. pre-fills the connected GitHub account
 2. accepts a login, `@handle`, or `github.com/<login>` URL
 3. links directly to the connected account's graph
-4. offers up to eight privately bookmarked people as restart points
+4. offers up to eight visible recent people as private restart points, including each person's saved trail and connection direction
 
 Opening a valid login creates `/app/explore/<login>?trail=<login>`.
 
@@ -294,8 +340,12 @@ The node route:
 7. lets every breadcrumb return to the corresponding trail prefix
 8. renders ranked repository cards with score, reasons, path accounts, metadata, and private save state
 9. calls `saveRepository` and updates the local query cache after a successful save
+10. calls `recordPersonVisit` after a profile resolves, preserving its bounded trail and direction without creating a bookmark
+11. exposes `setRecentPersonVisible` directly on the profile as **Remove from recent** / **Add to recent**
+12. renders expedition rank from the private monotonic `maxTrailDepth`, while the hop badge continues to show the current URL depth
+13. defers the optional public-event insight request until its section approaches the viewport, avoiding up to three cold GitHub REST requests for below-the-fold content
 
-The trail is URL state, not persisted private click history. It is therefore refreshable and shareable, while durable click-history storage remains future work.
+The active trail remains refreshable, shareable URL state. Its latest successful, shared-graph-validated route is also stored on that authenticated app user's private `RECENTLY_VIEWED` relationship to the shared `User`. Reopening a Recent people entry restores the complete saved breadcrumb and follower/following direction, resolving every stored hop through its stable GitHub id so profile renames remain valid. Explicitly removing a person sets that relationship invisible; later automatic visit recording updates its route but does not make it visible again until **Add to recent** is chosen. Each app user retains at most 50 visible recent people plus 50 hidden opt-outs. The numeric deepest trail is monotonic and is not reduced by returning to an earlier hop or removing a recent person.
 
 ### Saved and Settings
 
@@ -359,12 +409,13 @@ Implemented now:
 - cookie-authenticated GraphQL
 - bounded one-time OAuth state/nonce validation, durable bounded sessions, and canonical same-account reconnects
 - React click trail, compatibility routing, and repository save workflow
+- private recent people with restorable hop trails, explicit visibility, and persistent expedition progress
 - durable per-GitHub-identity REST budget status and fenced crawl serialization with a strict 1,000-request reserve
 - durable, resumable, per-user discovery warmup with bounded batches and authenticated GraphQL status
+- concurrent bounded GitHub collection fetches and batched Neo4j graph/contributor persistence for cold-node latency
 
 Not implemented:
 
 - general-purpose queued GitHub rate-budget scheduling beyond the synchronous reserve gate
-- persisted private click history
 
 Automated Rust and frontend checks exercise the in-process contracts. A live Neo4j, browser OAuth, and GitHub API round trip still requires Docker Desktop (or another Docker engine) plus valid GitHub OAuth credentials.

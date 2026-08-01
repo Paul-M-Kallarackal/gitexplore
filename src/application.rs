@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     bookmarks::{Bookmark, BookmarkTarget, Category},
-    discovery::{RepositoryCandidate, UserNeighborhood},
+    discovery::{
+        ExplorationActivity, ExplorationDirection, MAX_RECENT_PEOPLE, MAX_SAVED_TRAIL_ENTRIES,
+        RepositoryCandidate, UserNeighborhood,
+    },
     exploration::{ExplorationResult, ExplorationSeed, ExplorationSnapshot},
     graph::{
         CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus, GitHubRateLimitLease,
@@ -842,6 +845,61 @@ impl DiscoveryService for DefaultDiscoveryService {
             .await
     }
 
+    async fn exploration_activity(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> AppResult<ExplorationActivity> {
+        ensure(
+            (1..=MAX_RECENT_PEOPLE).contains(&limit),
+            format!("recent people limit must be between 1 and {MAX_RECENT_PEOPLE}"),
+        )?;
+        self.discovery_repo
+            .exploration_activity(user_id, limit)
+            .await
+    }
+
+    async fn record_person_visit(
+        &self,
+        user_id: &str,
+        login: &str,
+        trail: Vec<String>,
+        direction: ExplorationDirection,
+    ) -> AppResult<ExplorationActivity> {
+        let login = normalize_github_login(login)?;
+        ensure(!trail.is_empty(), "exploration trail cannot be empty")?;
+        ensure(
+            trail.len() <= MAX_SAVED_TRAIL_ENTRIES,
+            format!("exploration trail cannot contain more than {MAX_SAVED_TRAIL_ENTRIES} people"),
+        )?;
+        let trail = trail
+            .into_iter()
+            .map(|entry| normalize_github_login(&entry))
+            .collect::<AppResult<Vec<_>>>()?;
+        ensure_distinct_exploration_trail(&trail)?;
+        ensure(
+            trail
+                .last()
+                .is_some_and(|current| current.eq_ignore_ascii_case(&login)),
+            "exploration trail must end at the visited person",
+        )?;
+        self.discovery_repo
+            .record_person_visit(user_id, &login, trail, direction)
+            .await
+    }
+
+    async fn set_recent_person_visible(
+        &self,
+        user_id: &str,
+        login: &str,
+        visible: bool,
+    ) -> AppResult<ExplorationActivity> {
+        let login = normalize_github_login(login)?;
+        self.discovery_repo
+            .set_recent_person_visible(user_id, &login, visible)
+            .await
+    }
+
     async fn expand_user(&self, user_id: &str, login: &str) -> AppResult<UserNeighborhood> {
         self.expand_user_with_reserve(user_id, login, GITHUB_CORE_REST_RESERVE)
             .await
@@ -1601,6 +1659,13 @@ fn normalize_github_login(login: &str) -> AppResult<String> {
     Ok(login.to_ascii_lowercase())
 }
 
+fn ensure_distinct_exploration_trail(trail: &[String]) -> AppResult<()> {
+    ensure(
+        trail.iter().collect::<HashSet<_>>().len() == trail.len(),
+        "exploration trail cannot repeat a person",
+    )
+}
+
 async fn refresh_repository_contributors(
     insight_repo: Arc<dyn InsightRepository>,
     github: Arc<dyn GitHubClientPort>,
@@ -2195,7 +2260,8 @@ impl Drop for DurableRefreshGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        DISCOVERY_WARMUP_TOTAL_USER_LIMIT, advance_warmup_frontier, normalize_github_login,
+        DISCOVERY_WARMUP_TOTAL_USER_LIMIT, advance_warmup_frontier,
+        ensure_distinct_exploration_trail, normalize_github_login,
     };
     use crate::{
         discovery::{DiscoveryUser, UserNeighborhood},
@@ -2236,6 +2302,15 @@ mod tests {
             normalize_github_login(" Octo-Cat1 ").expect("valid GitHub login"),
             "octo-cat1"
         );
+    }
+
+    #[test]
+    fn exploration_trail_rejects_any_repeated_login() {
+        let trail = vec!["alice".to_string(), "bob".to_string(), "alice".to_string()];
+        assert!(matches!(
+            ensure_distinct_exploration_trail(&trail),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]

@@ -36,7 +36,7 @@ flowchart LR
     github["GitHub public API"]
     service["Rust application services"]
     public["Shared graph\nusers, repositories,\nFOLLOWS, STARRED, OWNS"]
-    private["Private overlay\nsessions, sync state,\nbookmarks, categories, snapshots"]
+    private["Private overlay\nsessions, sync state,\nbookmarks, recent trails, progress"]
     graphql["POST /graphql"]
     rest["Compatibility REST"]
     web["React/Vite UI"]
@@ -52,7 +52,7 @@ flowchart LR
     rest --> web
 ```
 
-Public GitHub identities, public repositories, and relationship facts are shared cache data. The authenticated app user owns connection credentials, the opaque browser session, bookmark state, categories, snapshots, sync state, and discovery-warmup progress. Repository discovery joins the shared facts to only the current user's save overlay. Browser connections are canonicalized by stable GitHub user id, so reconnecting the same GitHub account preserves that private overlay. The stable account link remains when credentials are disconnected.
+Public GitHub identities, public repositories, and relationship facts are shared cache data. The authenticated app user owns connection credentials, the opaque browser session, bookmark state, categories, snapshots, sync state, recent-person routes, expedition progress, and discovery-warmup progress. Repository discovery joins the shared facts to only the current user's save overlay. Browser connections are canonicalized by stable GitHub user id, so reconnecting the same GitHub account preserves that private overlay. The stable account link remains when credentials are disconnected.
 
 Shared graph identity is also stable-id first. Lowercase `login_key` and `full_name_key` properties provide case-insensitive alias lookup, while GitHub's numeric user/repository ids remain canonical. A rename moves the existing stable node to its new alias; reuse of an old alias by a different numeric id does not merge the two histories.
 
@@ -60,7 +60,7 @@ Shared graph identity is also stable-id first. Lowercase `login_key` and `full_n
 
 - `identity`: GitHub connection state and opaque browser sessions
 - `graph`: imports, freshness metadata, and sync state
-- `discovery`: directional neighborhoods and explainable repository ranking
+- `discovery`: directional neighborhoods, private recent trails/progress, and explainable repository ranking
 - `bookmarks`: private categories and saved user/repository targets
 - `exploration`: legacy seed-based results and private snapshots
 - `graphql`: typed neighborhood, expansion, and repository-save projection
@@ -90,8 +90,10 @@ The authenticated application keeps three primary areas: Explore for graph trave
 7. Concurrent expansion calls first deduplicate in-process and then acquire a fenced Neo4j lease keyed by `github-user:<lowercase-login>`; file mode keeps the in-process behavior.
 8. The entity-refresh leader serializes GitHub REST work through the connected account's durable `GitHubIdentity` lease, probes the current `core` bucket, and admits the operation only when its maximum cost leaves the strict 1,000-request reserve.
 9. `saveRepository` creates or reuses the current user's private bookmark.
-10. Neo4j replaces prior edges only for collections reported complete. Partial capped collections preserve prior edges and merge the returned entries; both paths run in the graph-import transaction. Bookmark writes are also transactional, and bookmark identity is protected by the owner/target uniqueness constraint.
-11. `startDiscoveryWarmup` idempotently creates the current user's private warmup job. A background driver expands one frontier login per batch, reusing the public entity-refresh and private account-budget leases, until the frontier is exhausted or the reserve rejects the next bounded expansion.
+10. After the profile request resolves, the four bounded follower, following, starred, and owned-repository collections are fetched concurrently. Neo4j imports the returned nodes and relationships with bounded `UNWIND` batches instead of one statement per item; repository contributors use the same batched write path.
+11. After a profile resolves, `recordPersonVisit` validates the shared-graph route and updates only the current user's bounded `RECENTLY_VIEWED` route and monotonic deepest-trail value. `setRecentPersonVisible` hides or restores that route without touching bookmarks or public graph facts.
+12. Neo4j replaces prior edges only for collections reported complete. Partial capped collections preserve prior edges and merge the returned entries; both paths run in the graph-import transaction. Bookmark writes are also transactional, and bookmark identity is protected by the owner/target uniqueness constraint.
+13. `startDiscoveryWarmup` idempotently creates the current user's private warmup job. A background driver expands one frontier login per batch, reusing the public entity-refresh and private account-budget leases, until the frontier is exhausted or the reserve rejects the next bounded expansion.
 
 See [Graph explorer and GraphQL](graph-explorer.md) for operation examples and the frontend trail workflow.
 
@@ -127,7 +129,7 @@ The GraphQL explorer is additive. Existing health, auth, sync, bookmark, categor
 
 ## Current verification boundary
 
-- Rust tests cover GraphQL authentication/schema behavior, OAuth state validation across service replicas, authenticated-encryption tamper rejection, legacy identity-file encryption, canonical reconnects and browser logout, direction preservation, coverage-aware partial imports, bounded public-only imports, ranking, private saved-state isolation, freshness, transactional bookmark behavior, cancellation-safe in-process expansion deduplication, shared cross-instance leases, stale-token fencing, warmup start deduplication/resume/reserve/isolation, and embedded schema parsing/checksums.
-- API-client tests cover GraphQL request construction.
-- React/Vite checks and route utility tests cover the click-trail helpers, compatibility redirects, and UI types.
-- Live Neo4j initialization and browser OAuth/GitHub API behavior still require a running Docker engine and valid GitHub credentials.
+- Rust tests cover GraphQL authentication/schema behavior, private recent-route ordering/visibility/isolation and monotonic rank, OAuth state validation across service replicas, authenticated-encryption tamper rejection, legacy identity-file encryption, canonical reconnects and browser logout, direction preservation, coverage-aware partial imports, bounded public-only imports, ranking, private saved-state isolation, freshness, transactional bookmark behavior, cancellation-safe in-process expansion deduplication, shared cross-instance leases, stale-token fencing, warmup start deduplication/resume/reserve/isolation, and embedded schema parsing/checksums.
+- API-client tests cover GraphQL request construction and recent-route direction normalization.
+- React/Vite checks and tests cover click-trail helpers, recent-route restoration, direct visibility toggling, persistent-rank presentation, compatibility redirects, and UI types.
+- An ignored live Neo4j integration test exercises batched graph/contributor imports plus a private recent-route round trip when a local instance is available. Browser OAuth and real GitHub API behavior still require valid GitHub credentials.

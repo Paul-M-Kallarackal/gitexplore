@@ -11,10 +11,20 @@ describe('ExpeditionProgress', () => {
   });
 
   it('explains progress without making the illustration meaningful content', () => {
-    const { container } = render(<ExpeditionProgress trailDepth={2} repositoryCount={17} />);
-    expect(screen.getByRole('heading', { level: 2, name: 'Scout' })).toBeInTheDocument();
-    expect(screen.getByText('Follow 1 more connection to become a Pathfinder.')).toBeInTheDocument();
+    const { container } = render(<ExpeditionProgress currentTrailDepth={0} earnedTrailDepth={3} repositoryCount={17} />);
+    expect(screen.getByRole('heading', { level: 2, name: 'Pathfinder' })).toBeInTheDocument();
+    expect(screen.getByText('Follow 3 more connections to become a Cartographer.')).toBeInTheDocument();
+    expect(screen.getByText('0 hops now')).toBeInTheDocument();
+    expect(screen.getByText('3')).toBeInTheDocument();
     expect(screen.getByText('17')).toBeInTheDocument();
     expect(container.querySelector('img')).toHaveAttribute('alt', '');
+  });
+
+  it('does not award rank from unvalidated URL depth', () => {
+    const { container } = render(<ExpeditionProgress currentTrailDepth={7} earnedTrailDepth={1} repositoryCount={0} />);
+    expect(screen.getByRole('heading', { level: 2, name: 'Scout' })).toBeInTheDocument();
+    expect(screen.getByText('7 hops now')).toBeInTheDocument();
+    const deepestTrail = Array.from(container.querySelectorAll('dt')).find((item) => item.textContent === 'Deepest trail');
+    expect(deepestTrail?.nextElementSibling).toHaveTextContent('1');
   });
 });

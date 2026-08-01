@@ -3,7 +3,7 @@ use secrecy::SecretString;
 
 use crate::{
     bookmarks::{Bookmark, BookmarkTarget, Category},
-    discovery::{RepositoryCandidate, UserNeighborhood},
+    discovery::{ExplorationActivity, ExplorationDirection, RepositoryCandidate, UserNeighborhood},
     exploration::{ExplorationResult, ExplorationSeed, ExplorationSnapshot},
     graph::{
         DiscoveryWarmupJob, GitHubRateLimitLease, GitHubRateLimitStatus, GraphImport, RefreshLease,
@@ -199,6 +199,24 @@ pub trait DiscoveryRepository: Send + Sync {
         login: &str,
         limit: usize,
     ) -> AppResult<Vec<RepositoryCandidate>>;
+    async fn exploration_activity(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> AppResult<ExplorationActivity>;
+    async fn record_person_visit(
+        &self,
+        user_id: &str,
+        login: &str,
+        trail: Vec<String>,
+        direction: ExplorationDirection,
+    ) -> AppResult<ExplorationActivity>;
+    async fn set_recent_person_visible(
+        &self,
+        user_id: &str,
+        login: &str,
+        visible: bool,
+    ) -> AppResult<ExplorationActivity>;
 }
 
 #[async_trait]
@@ -344,6 +362,24 @@ pub trait DiscoveryService: Send + Sync {
         login: &str,
         limit: usize,
     ) -> AppResult<Vec<RepositoryCandidate>>;
+    async fn exploration_activity(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> AppResult<ExplorationActivity>;
+    async fn record_person_visit(
+        &self,
+        user_id: &str,
+        login: &str,
+        trail: Vec<String>,
+        direction: ExplorationDirection,
+    ) -> AppResult<ExplorationActivity>;
+    async fn set_recent_person_visible(
+        &self,
+        user_id: &str,
+        login: &str,
+        visible: bool,
+    ) -> AppResult<ExplorationActivity>;
     async fn expand_user(&self, user_id: &str, login: &str) -> AppResult<UserNeighborhood>;
     async fn expand_user_with_reserve(
         &self,

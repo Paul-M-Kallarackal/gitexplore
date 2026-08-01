@@ -404,8 +404,10 @@ a {
 
 .login-thesis h1 {
   max-width: 13ch;
-  font-size: clamp(var(--type-size-3xl), 6vw, var(--type-size-heading));
-  line-height: 0.96;
+  font-size: clamp(var(--type-size-3xl), 5.4vw, calc(var(--type-size-heading) * 0.875));
+  font-weight: var(--type-weight-regular);
+  letter-spacing: var(--type-tracking-heading);
+  line-height: 0.99;
 }
 
 .login-hero-copy {
@@ -593,9 +595,17 @@ a {
 }
 
 .saved-person-list a > span:nth-child(2) {
+  min-width: 0;
   flex: 1;
   font-family: var(--font-mono);
   font-size: var(--type-size-sm);
+  overflow-wrap: anywhere;
+}
+
+.saved-person-list a > span:nth-child(2) small {
+  color: var(--muted-foreground);
+  font-family: var(--font-body);
+  font-size: var(--type-size-xs);
 }
 
 .saved-person-list a:hover,
@@ -720,6 +730,7 @@ a {
 
 .node-person > div {
   display: grid;
+  min-width: 0;
   gap: var(--space-2);
 }
 
@@ -730,9 +741,11 @@ a {
 }
 
 .mono-handle {
+  min-width: 0;
   color: var(--primary);
   font-family: var(--font-mono);
   font-size: var(--type-size-sm);
+  overflow-wrap: anywhere;
 }
 
 .node-actions,
@@ -808,9 +821,16 @@ a {
   mask-image: linear-gradient(90deg, transparent, var(--foreground) 20%);
 }
 
+.expedition-progress-loading > :last-child {
+  width: 100%;
+  height: 100%;
+  min-height: 10rem;
+  border-radius: 0;
+}
+
 .expedition-facts {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0;
   margin: 0;
   border-top: var(--border-weight-subtle) solid var(--border);
@@ -877,6 +897,31 @@ a {
   display: grid;
   min-width: 0;
   gap: var(--space-8);
+}
+
+.insights-gate {
+  min-width: 0;
+  min-height: 8rem;
+}
+
+.insight-deferred,
+.insight-loading {
+  display: flex;
+  min-height: 8rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  border-top: var(--border-weight-subtle) solid var(--border-strong);
+  padding-top: var(--space-5);
+}
+
+.insight-deferred > div {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.insight-loading > * {
+  width: 100%;
 }
 
 .commit-signal,
@@ -1838,6 +1883,11 @@ a {
   .repository-actions,
   .warmup-actions,
   .connection-settings {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .insight-deferred {
     align-items: stretch;
     flex-direction: column;
   }

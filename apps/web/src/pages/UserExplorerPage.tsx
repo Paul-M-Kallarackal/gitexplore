@@ -3,7 +3,7 @@ import { GitExploreApiError, type RepositoryCandidate, type UserNeighborhood } f
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { Alert, Avatar, Badge, Button, Heading, Skeleton, Tabs, Text } from 'strawn';
-import { ArrowLeftIcon, CircleAlertIcon, ExternalLinkIcon, RefreshIcon, UsersIcon } from 'strawn-icons';
+import { ArrowLeftIcon, CircleAlertIcon, ExternalLinkIcon, EyeOffIcon, HistoryIcon, RefreshIcon, UsersIcon } from 'strawn-icons';
 
 import { api } from '../api';
 import { ExpeditionProgress } from '../components/ExpeditionProgress';
@@ -16,6 +16,41 @@ import { cacheLabel, compactNumber } from '../lib/format';
 import { useDocumentTitle } from '../useDocumentTitle';
 
 const neighborhoodLimit = 36;
+const explorationActivityKey = ['exploration-activity'] as const;
+const explorationActivityMutationScope = { id: 'exploration-activity-writes' } as const;
+
+type VisitWriteState = {
+  status: 'pending' | 'success' | 'error';
+  error?: Error;
+};
+
+type VisitRequest = {
+  visitKey: string;
+  requestedLogin: string;
+  requestedTrail: string[];
+  requestedDirection: 'followers' | 'following';
+};
+
+type VisibilityRequest = {
+  personKey: string;
+  requestedLogin: string;
+  visible: boolean;
+};
+
+type VisibilityWriteState = VisibilityRequest & {
+  status: 'pending' | 'success' | 'error';
+  error?: Error;
+};
+
+function visibilityWriteShouldRetry(failureCount: number, error: Error) {
+  if (failureCount >= 1) return false;
+  if (!(error instanceof GitExploreApiError)) return true;
+  return error.status === 408 || error.status === 429 || error.status >= 500;
+}
+
+function errorValue(error: unknown, fallback: string) {
+  return error instanceof Error ? error : new Error(fallback);
+}
 
 export function neighborhoodNeedsExpansion(value: UserNeighborhood | null) {
   return value === null || value.lastFetchedAt === null;
@@ -34,13 +69,21 @@ export function UserExplorerPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const attemptedAutoExpansions = useRef(new Set<string>());
+  const attemptedVisitKeys = useRef(new Set<string>());
   const [visibleRepositories, setVisibleRepositories] = useState(8);
   const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
+  const [visitWrites, setVisitWrites] = useState<Record<string, VisitWriteState>>({});
+  const [visibilityWrite, setVisibilityWrite] = useState<VisibilityWriteState | null>(null);
+  const [insightsRequestedFor, setInsightsRequestedFor] = useState<string | null>(null);
+  const insightsGateRef = useRef<HTMLDivElement>(null);
 
   const login = normalizeLoginInput(rawLogin);
   const validLogin = isLikelyGitHubLogin(login);
+  const loginKey = login.toLowerCase();
   const trail = useMemo(() => normalizeTrail(searchParams.get('trail'), login), [login, searchParams]);
   const direction = normalizeConnectionDirection(searchParams.get('direction'));
+  const insightsRequested = insightsRequestedFor === loginKey;
+  const intersectionObserverAvailable = typeof IntersectionObserver !== 'undefined';
   useDocumentTitle(validLogin ? `@${login}` : 'Explore');
 
   const neighborhoodQuery = useQuery({
@@ -62,12 +105,78 @@ export function UserExplorerPage() {
   const expansion = useMutation({
     mutationFn: ({ requestedLogin }: { requestedLogin: string; automatic: boolean }) => api.expandUser(requestedLogin, neighborhoodLimit),
     retry: false,
-    onSuccess: async (neighborhood, variables) => {
+    onSuccess: (neighborhood, variables) => {
       queryClient.setQueryData(neighborhoodKey(variables.requestedLogin), neighborhood);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['user-insights', variables.requestedLogin.toLowerCase()] }),
-        queryClient.invalidateQueries({ queryKey: ['github-rate-limit'] }),
-      ]);
+      void queryClient.invalidateQueries({ queryKey: ['github-rate-limit'] });
+    },
+  });
+
+  const activityQuery = useQuery({
+    queryKey: explorationActivityKey,
+    queryFn: () => api.getExplorationActivity(),
+    enabled: validLogin,
+    staleTime: 60_000,
+    retry: false,
+  });
+
+  const recordVisitMutation = useMutation({
+    scope: explorationActivityMutationScope,
+    mutationFn: ({ requestedLogin, requestedTrail, requestedDirection }: VisitRequest) =>
+      api.recordPersonVisit(requestedLogin, requestedTrail, requestedDirection),
+    // A timed-out response can arrive after the server committed the visit.
+    // Keep this non-idempotent write explicit so visit_count cannot double.
+    retry: false,
+    onMutate: async (variables) => {
+      setVisitWrites((current) => ({
+        ...current,
+        [variables.visitKey]: { status: 'pending' },
+      }));
+      await queryClient.cancelQueries({ queryKey: explorationActivityKey });
+    },
+    onSuccess: async (activity, variables) => {
+      await queryClient.cancelQueries({ queryKey: explorationActivityKey });
+      queryClient.setQueryData(explorationActivityKey, activity);
+      setVisitWrites((current) => ({
+        ...current,
+        [variables.visitKey]: { status: 'success' },
+      }));
+    },
+    onError: (error, variables) => {
+      setVisitWrites((current) => ({
+        ...current,
+        [variables.visitKey]: {
+          status: 'error',
+          error: errorValue(error, 'The person could not be added to recent people.'),
+        },
+      }));
+      void queryClient.invalidateQueries({ queryKey: explorationActivityKey });
+    },
+  });
+
+  const visibilityMutation = useMutation({
+    scope: explorationActivityMutationScope,
+    mutationFn: ({ requestedLogin, visible }: VisibilityRequest) =>
+      api.setRecentPersonVisible(requestedLogin, visible),
+    retry: visibilityWriteShouldRetry,
+    retryDelay: 150,
+    onMutate: async (variables) => {
+      setVisibilityWrite({ ...variables, status: 'pending', error: undefined });
+      await queryClient.cancelQueries({ queryKey: explorationActivityKey });
+    },
+    onSuccess: async (activity, variables) => {
+      await queryClient.cancelQueries({ queryKey: explorationActivityKey });
+      queryClient.setQueryData(explorationActivityKey, activity);
+      setVisibilityWrite({ ...variables, status: 'success', error: undefined });
+    },
+    onError: (error, variables) => {
+      setVisibilityWrite({
+        ...variables,
+        status: 'error',
+        error: errorValue(error, variables.visible
+          ? 'The person could not be added to recent people.'
+          : 'The person could not be removed from recent people.'),
+      });
+      void queryClient.invalidateQueries({ queryKey: explorationActivityKey });
     },
   });
 
@@ -81,20 +190,51 @@ export function UserExplorerPage() {
   }, [login]);
 
   useEffect(() => {
+    if (!validLogin || !neighborhood) return;
+    const canonicalTrail = trail.map((entry, index) => index === trail.length - 1 ? neighborhood.user.login : entry);
+    const visitKey = `${neighborhood.user.githubId}|${canonicalTrail.map((entry) => entry.toLowerCase()).join(',')}|${direction}`;
+    if (attemptedVisitKeys.current.has(visitKey)) return;
+    attemptedVisitKeys.current.add(visitKey);
+    recordVisitMutation.mutate({
+      visitKey,
+      requestedLogin: neighborhood.user.login,
+      requestedTrail: canonicalTrail,
+      requestedDirection: direction,
+    });
+  }, [direction, login, neighborhood, recordVisitMutation, trail, validLogin]);
+
+  useEffect(() => {
     const key = login.toLowerCase();
     if (!validLogin || !neighborhoodQuery.isSuccess || !neighborhoodNeedsExpansion(neighborhoodQuery.data) || attemptedAutoExpansions.current.has(key)) return;
     attemptedAutoExpansions.current.add(key);
     expansion.mutate({ requestedLogin: login, automatic: true });
   }, [expansion, login, neighborhoodQuery.data, neighborhoodQuery.isSuccess, validLogin]);
 
+  useEffect(() => {
+    if (!validLogin || !neighborhood || insightsRequested || !intersectionObserverAvailable) return;
+    const target = insightsGateRef.current;
+    if (!target) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      setInsightsRequestedFor(loginKey);
+      observer.disconnect();
+    }, { rootMargin: '240px 0px' });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [insightsRequested, intersectionObserverAvailable, loginKey, neighborhood, validLogin]);
+
   const insightsQuery = useQuery({
     queryKey: ['user-insights', login.toLowerCase(), 12],
     queryFn: () => api.getUserInsights(login, 12),
-    enabled: validLogin && Boolean(neighborhood),
+    enabled: validLogin && Boolean(neighborhood) && insightsRequested,
     staleTime: 10 * 60_000,
     gcTime: 60 * 60_000,
     retry: false,
   });
+
+  function requestInsights() {
+    setInsightsRequestedFor(loginKey);
+  }
 
   const saveMutation = useMutation({
     mutationFn: (fullName: string) => api.saveRepository(fullName, [], null),
@@ -173,6 +313,39 @@ export function UserExplorerPage() {
 
   const expandingCurrent = currentExpansionPending;
   const displayedRepositories = neighborhood.repositories.slice(0, visibleRepositories);
+  const currentUser = neighborhood.user;
+  const currentTrailDepth = Math.max(0, trail.length - 1);
+  const earnedTrailDepth = activityQuery.data?.maxTrailDepth ?? 0;
+  const canonicalTrail = trail.map((entry, index) => index === trail.length - 1 ? currentUser.login : entry);
+  const currentVisitKey = `${currentUser.githubId}|${canonicalTrail.map((entry) => entry.toLowerCase()).join(',')}|${direction}`;
+  const currentVisitWrite = visitWrites[currentVisitKey];
+  const currentRecentPerson = activityQuery.data?.recentPeople.find(
+    (person) => person.user.githubId === currentUser.githubId,
+  );
+  const currentPersonIsRecent = currentRecentPerson?.visible === true;
+  const currentVisibilityWrite = visibilityWrite?.personKey === currentUser.githubId
+    ? visibilityWrite
+    : null;
+  const recentControlPending = currentVisitWrite?.status === 'pending'
+    || currentVisibilityWrite?.status === 'pending'
+    || (activityQuery.isPending && !currentRecentPerson);
+
+  function recordCurrentVisit() {
+    recordVisitMutation.mutate({
+      visitKey: currentVisitKey,
+      requestedLogin: currentUser.login,
+      requestedTrail: canonicalTrail,
+      requestedDirection: direction,
+    });
+  }
+
+  function changeRecentVisibility(visible: boolean) {
+    visibilityMutation.mutate({
+      personKey: currentUser.githubId,
+      requestedLogin: currentUser.login,
+      visible,
+    });
+  }
 
   return (
     <div className="page-stack">
@@ -198,6 +371,25 @@ export function UserExplorerPage() {
           <a className="secondary-link" href={neighborhood.user.url} target="_blank" rel="noreferrer">
             GitHub <ExternalLinkIcon aria-hidden="true" size={14} /><span className="visually-hidden"> opens in a new tab</span>
           </a>
+          <Button
+            variant="outline"
+            loading={recentControlPending}
+            disabled={recentControlPending}
+            leftIcon={currentRecentPerson && currentPersonIsRecent
+              ? <EyeOffIcon aria-hidden="true" size={16} />
+              : <HistoryIcon aria-hidden="true" size={16} />}
+            onClick={() => currentRecentPerson
+              ? changeRecentVisibility(!currentPersonIsRecent)
+              : recordCurrentVisit()}
+          >
+            {recentControlPending
+              ? 'Saving recent status'
+              : currentPersonIsRecent
+                ? 'Remove from recent'
+                : currentVisitWrite?.status === 'error'
+                  ? 'Retry recent save'
+                  : 'Add to recent'}
+          </Button>
           <Button
             loading={expandingCurrent}
             leftIcon={<RefreshIcon aria-hidden="true" size={16} />}
@@ -227,7 +419,55 @@ export function UserExplorerPage() {
         </Alert>
       ) : null}
 
-      <ExpeditionProgress trailDepth={Math.max(0, trail.length - 1)} repositoryCount={neighborhood.repositories.length} />
+      {activityQuery.isError ? (
+        <Alert
+          tone="warning"
+          title="Saved expedition progress is unavailable"
+          action={<Button variant="outline" onClick={() => void activityQuery.refetch()}>Try again</Button>}
+        >
+          Your current trail remains visible while GitExplore reconnects to your private history.
+        </Alert>
+      ) : null}
+
+      {currentVisitWrite?.status === 'error' ? (
+        <Alert
+          tone="error"
+          title="Recent person was not saved"
+          action={<Button variant="outline" onClick={recordCurrentVisit}>Try again</Button>}
+        >
+          {currentVisitWrite.error?.message ?? 'The person could not be added to recent people.'}
+        </Alert>
+      ) : null}
+
+      {currentVisibilityWrite?.status === 'error' ? (
+        <Alert
+          tone="error"
+          title={currentVisibilityWrite.visible ? 'Could not add this person to recent' : 'Could not remove this person from recent'}
+          action={
+            <Button variant="outline" onClick={() => changeRecentVisibility(currentVisibilityWrite.visible)}>
+              Try again
+            </Button>
+          }
+        >
+          {currentVisibilityWrite.error?.message ?? 'The recent people preference was not changed.'}
+        </Alert>
+      ) : null}
+
+      {activityQuery.isPending ? (
+        <section className="expedition-progress expedition-progress-loading" aria-label="Loading expedition progress" aria-busy="true">
+          <div className="expedition-progress-copy">
+            <Skeleton variant="text" lines={3} />
+            <Skeleton variant="block" height="2.5rem" />
+          </div>
+          <Skeleton variant="block" height="10rem" />
+        </section>
+      ) : (
+        <ExpeditionProgress
+          currentTrailDepth={currentTrailDepth}
+          earnedTrailDepth={earnedTrailDepth}
+          repositoryCount={neighborhood.repositories.length}
+        />
+      )}
 
       <div className="atlas-grid">
         <aside className="connection-panel" aria-label="Connections">
@@ -243,9 +483,38 @@ export function UserExplorerPage() {
         </aside>
 
         <div className="discovery-column">
-          {insightsQuery.isPending ? <section className="insight-loading" aria-busy="true"><Skeleton variant="text" lines={4} /></section> : null}
-          {insightsQuery.data ? <UserInsights insight={insightsQuery.data} trail={trail} direction={direction} /> : null}
-          {insightsQuery.isError ? <Alert tone="error" title="Recent commit activity is unavailable">The cached graph remains available.</Alert> : null}
+          <div ref={insightsGateRef} className="insights-gate">
+            {!insightsRequested ? (
+              <section className="insight-deferred" aria-label="Recent work">
+                <div>
+                  <Text size="xs" color="$mutedForeground">Recent public work</Text>
+                  <Heading size="h2">Activity near this person</Heading>
+                  <Text size="sm" color="$mutedForeground">
+                    {intersectionObserverAvailable
+                      ? 'Recent work loads as you approach this section.'
+                      : 'Load recent public work when you are ready.'}
+                  </Text>
+                </div>
+                {!intersectionObserverAvailable ? (
+                  <Button variant="outline" onClick={requestInsights}>Load recent work</Button>
+                ) : null}
+              </section>
+            ) : (
+              <>
+                {insightsQuery.isPending ? <section className="insight-loading" aria-busy="true"><Skeleton variant="text" lines={4} /></section> : null}
+                {insightsQuery.data ? <UserInsights insight={insightsQuery.data} trail={trail} direction={direction} /> : null}
+                {insightsQuery.isError ? (
+                  <Alert
+                    tone="error"
+                    title="Recent commit activity is unavailable"
+                    action={<Button variant="outline" onClick={() => void insightsQuery.refetch()}>Try again</Button>}
+                  >
+                    The cached graph remains available.
+                  </Alert>
+                ) : null}
+              </>
+            )}
+          </div>
 
           <section className="discoveries" aria-labelledby="discoveries-title">
             <div className="section-heading-row discoveries-heading">

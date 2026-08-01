@@ -231,6 +231,68 @@ describe('createGitExploreApi', () => {
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: 'include' });
   });
 
+  it('persists recent people with their hop trail and normalizes direction', async () => {
+    const fetchMock = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      if (body.query.includes('mutation RecordPersonVisit')) {
+        expect(body.variables).toEqual({
+          login: 'bob',
+          trail: ['alice', 'bob'],
+          direction: 'FOLLOWING'
+        });
+      }
+      const activity = {
+        recentPeople: [
+          {
+            user: {
+              githubId: '2',
+              login: 'bob',
+              name: 'Bob',
+              url: 'https://github.com/bob',
+              avatarUrl: null,
+              bio: null,
+              followersCount: 3,
+              followingCount: 4
+            },
+            trail: ['alice', 'bob'],
+            direction: 'FOLLOWING',
+            lastViewedAt: '2026-08-01T10:00:00Z',
+            visitCount: 2,
+            visible: true
+          }
+        ],
+        maxTrailDepth: 3
+      };
+      return Response.json({
+        data: body.query.includes('mutation RecordPersonVisit')
+          ? { recordPersonVisit: activity }
+          : { explorationActivity: activity }
+      });
+    });
+    const api = createGitExploreApi({
+      baseUrl: 'http://localhost:4000',
+      fetch: fetchMock as typeof fetch
+    });
+
+    const recorded = await api.recordPersonVisit(
+      'bob',
+      ['alice', 'bob'],
+      'following'
+    );
+    const loaded = await api.getExplorationActivity();
+
+    expect(recorded.recentPeople[0]).toMatchObject({
+      direction: 'following',
+      trail: ['alice', 'bob'],
+      visible: true
+    });
+    expect(loaded.maxTrailDepth).toBe(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('preserves GraphQL database-capacity details', async () => {
     const fetchMock = vi.fn(async () =>
       Response.json({

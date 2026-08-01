@@ -15,7 +15,7 @@ use chacha20poly1305::{
 use chrono::{DateTime, Duration, Utc};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use neo4rs::{Graph, Row, Txn, query};
+use neo4rs::{BoltType, Graph, Row, Txn, query};
 use octocrab::{Page, auth::DeviceCodes};
 use secrecy::{ExposeSecret, SecretBox, SecretString, zeroize::Zeroize};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -26,8 +26,9 @@ use crate::{
     bookmarks::{Bookmark, BookmarkTarget, Category},
     config::{Neo4jConfig, read_json_file, write_json_file},
     discovery::{
-        DiscoveryRepositoryRecord, DiscoveryUser, RepositoryCandidate, RepositoryGraphSignals,
-        UserNeighborhood, rank_repository_candidate,
+        DiscoveryRepositoryRecord, DiscoveryUser, ExplorationActivity, ExplorationDirection,
+        MAX_HIDDEN_RECENT_PEOPLE, MAX_RECENT_PEOPLE, RecentPerson, RepositoryCandidate,
+        RepositoryGraphSignals, UserNeighborhood, rank_repository_candidate,
     },
     exploration::{ExplorationResult, ExplorationSeed, ExplorationSnapshot},
     graph::{
@@ -611,6 +612,173 @@ struct GraphStore {
     categories: HashMap<String, Vec<Category>>,
     bookmarks: HashMap<String, Vec<Bookmark>>,
     snapshots: HashMap<String, Vec<ExplorationSnapshot>>,
+    #[serde(default)]
+    exploration_activity: HashMap<String, StoredExplorationActivity>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct StoredExplorationActivity {
+    recent_people: Vec<StoredRecentPerson>,
+    max_trail_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredRecentPerson {
+    github_id: i64,
+    #[serde(default)]
+    trail_github_ids: Vec<i64>,
+    #[serde(default)]
+    trail: Vec<String>,
+    direction: ExplorationDirection,
+    last_viewed_at: DateTime<Utc>,
+    visit_count: u64,
+    #[serde(default = "visible_by_default")]
+    visible: bool,
+}
+
+fn visible_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedExplorationTrail {
+    github_ids: Vec<i64>,
+    logins: Vec<String>,
+}
+
+fn prune_stored_recent_people(activity: &mut StoredExplorationActivity) {
+    let mut visible = 0usize;
+    let mut hidden = 0usize;
+    activity.recent_people.retain(|person| {
+        if person.visible {
+            visible += 1;
+            visible <= MAX_RECENT_PEOPLE
+        } else {
+            hidden += 1;
+            hidden <= MAX_HIDDEN_RECENT_PEOPLE
+        }
+    });
+}
+
+fn resolve_local_exploration_trail(
+    shared: &SharedGraphStore,
+    trail: &[String],
+) -> AppResult<ResolvedExplorationTrail> {
+    let mut github_ids = Vec::with_capacity(trail.len());
+    let mut logins = Vec::with_capacity(trail.len());
+    for requested in trail {
+        let canonical = resolve_shared_login(shared, requested).ok_or_else(|| {
+            AppError::Validation(format!(
+                "exploration trail contains unknown github user `{requested}`"
+            ))
+        })?;
+        let profile = shared
+            .users
+            .get(&canonical)
+            .expect("resolved shared user exists");
+        github_ids.push(profile.github_id);
+        logins.push(profile.login.clone());
+    }
+
+    if github_ids.iter().copied().collect::<HashSet<_>>().len() != github_ids.len() {
+        return Err(AppError::Validation(
+            "exploration trail cannot repeat a person".to_string(),
+        ));
+    }
+
+    for logins in logins.windows(2) {
+        let connected = shared
+            .follows
+            .contains(&(logins[0].clone(), logins[1].clone()))
+            || shared
+                .follows
+                .contains(&(logins[1].clone(), logins[0].clone()));
+        if !connected {
+            return Err(AppError::Validation(format!(
+                "exploration trail hop `{}` -> `{}` is not present in the shared graph",
+                logins[0], logins[1]
+            )));
+        }
+    }
+
+    Ok(ResolvedExplorationTrail { github_ids, logins })
+}
+
+fn canonicalize_stored_trail(
+    recent: &StoredRecentPerson,
+    profiles_by_id: &HashMap<i64, &GitHubUserNode>,
+    target: &GitHubUserNode,
+) -> Vec<String> {
+    if recent.trail_github_ids.is_empty() {
+        let mut legacy = recent
+            .trail
+            .iter()
+            .map(|login| {
+                profiles_by_id
+                    .values()
+                    .find(|profile| profile.login.eq_ignore_ascii_case(login))
+                    .map_or_else(|| login.clone(), |profile| profile.login.clone())
+            })
+            .collect::<Vec<_>>();
+        if let Some(last) = legacy.last_mut() {
+            *last = target.login.clone();
+        } else {
+            legacy.push(target.login.clone());
+        }
+        return legacy;
+    }
+
+    recent
+        .trail_github_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, github_id)| {
+            profiles_by_id
+                .get(github_id)
+                .map(|profile| profile.login.clone())
+                .or_else(|| recent.trail.get(index).cloned())
+                .or_else(|| (*github_id == target.github_id).then(|| target.login.clone()))
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalTrailHop {
+    github_id: i64,
+    login: String,
+}
+
+fn canonicalize_neo4j_trail(
+    trail_github_ids: &[i64],
+    legacy_trail: &[String],
+    canonical_hops: Vec<CanonicalTrailHop>,
+    target: &GitHubUserNode,
+) -> Vec<String> {
+    if trail_github_ids.is_empty() {
+        let mut trail = legacy_trail.to_vec();
+        if let Some(last) = trail.last_mut() {
+            *last = target.login.clone();
+        } else {
+            trail.push(target.login.clone());
+        }
+        return trail;
+    }
+
+    let canonical_hops = canonical_hops
+        .into_iter()
+        .map(|hop| (hop.github_id, hop.login))
+        .collect::<HashMap<_, _>>();
+    trail_github_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, github_id)| {
+            canonical_hops
+                .get(github_id)
+                .cloned()
+                .or_else(|| legacy_trail.get(index).cloned())
+                .or_else(|| (*github_id == target.github_id).then(|| target.login.clone()))
+        })
+        .collect()
 }
 
 pub struct JsonIdentityRepository {
@@ -1730,6 +1898,165 @@ impl DiscoveryRepository for LocalDiscoveryRepository {
         candidates.truncate(limit);
         Ok(candidates)
     }
+
+    async fn exploration_activity(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> AppResult<ExplorationActivity> {
+        let guard = self.store.lock()?;
+        Ok(exploration_activity_from_store(&guard, user_id, limit))
+    }
+
+    async fn record_person_visit(
+        &self,
+        user_id: &str,
+        login: &str,
+        trail: Vec<String>,
+        direction: ExplorationDirection,
+    ) -> AppResult<ExplorationActivity> {
+        let mut guard = self.store.lock()?;
+        let canonical = resolve_shared_login(&guard.shared, login).ok_or_else(|| {
+            AppError::NotFound(format!(
+                "github user `{login}` is not present in the shared graph"
+            ))
+        })?;
+        let github_id = guard
+            .shared
+            .users
+            .get(&canonical)
+            .expect("resolved shared user exists")
+            .github_id;
+        let resolved_trail = resolve_local_exploration_trail(&guard.shared, &trail)?;
+        if resolved_trail.github_ids.last().copied() != Some(github_id) {
+            return Err(AppError::Validation(
+                "exploration trail must end at the visited person".to_string(),
+            ));
+        }
+        let now = Utc::now();
+        let trail_depth = resolved_trail.github_ids.len().saturating_sub(1);
+        let activity = guard
+            .exploration_activity
+            .entry(user_id.to_string())
+            .or_default();
+        let mut recent = activity
+            .recent_people
+            .iter()
+            .position(|person| person.github_id == github_id)
+            .map(|position| activity.recent_people.remove(position))
+            .unwrap_or(StoredRecentPerson {
+                github_id,
+                trail_github_ids: Vec::new(),
+                trail: Vec::new(),
+                direction,
+                last_viewed_at: now,
+                visit_count: 0,
+                visible: true,
+            });
+        recent.trail_github_ids = resolved_trail.github_ids;
+        recent.trail = resolved_trail.logins;
+        recent.direction = direction;
+        recent.last_viewed_at = now;
+        recent.visit_count = recent.visit_count.saturating_add(1);
+        activity.recent_people.insert(0, recent);
+        prune_stored_recent_people(activity);
+        activity.max_trail_depth = activity.max_trail_depth.max(trail_depth);
+        self.store.persist(&guard)?;
+        Ok(exploration_activity_from_store(
+            &guard,
+            user_id,
+            MAX_RECENT_PEOPLE,
+        ))
+    }
+
+    async fn set_recent_person_visible(
+        &self,
+        user_id: &str,
+        login: &str,
+        visible: bool,
+    ) -> AppResult<ExplorationActivity> {
+        let mut guard = self.store.lock()?;
+        let canonical = resolve_shared_login(&guard.shared, login).ok_or_else(|| {
+            AppError::NotFound(format!(
+                "github user `{login}` is not present in the shared graph"
+            ))
+        })?;
+        let github_id = guard
+            .shared
+            .users
+            .get(&canonical)
+            .expect("resolved shared user exists")
+            .github_id;
+        let activity = guard
+            .exploration_activity
+            .get_mut(user_id)
+            .ok_or_else(|| AppError::NotFound("recent person was not recorded".to_string()))?;
+        let position = activity
+            .recent_people
+            .iter()
+            .position(|person| person.github_id == github_id)
+            .ok_or_else(|| AppError::NotFound("recent person was not recorded".to_string()))?;
+        let mut recent = activity.recent_people.remove(position);
+        recent.visible = visible;
+        recent.last_viewed_at = Utc::now();
+        activity.recent_people.insert(0, recent);
+        prune_stored_recent_people(activity);
+        self.store.persist(&guard)?;
+        Ok(exploration_activity_from_store(
+            &guard,
+            user_id,
+            MAX_RECENT_PEOPLE,
+        ))
+    }
+}
+
+fn exploration_activity_from_store(
+    store: &GraphStore,
+    user_id: &str,
+    limit: usize,
+) -> ExplorationActivity {
+    let Some(activity) = store.exploration_activity.get(user_id) else {
+        return ExplorationActivity::default();
+    };
+    let profiles_by_id = store
+        .shared
+        .users
+        .values()
+        .map(|profile| (profile.github_id, profile))
+        .collect::<HashMap<_, _>>();
+    let mut visible = 0usize;
+    let mut hidden = 0usize;
+    let recent_people = activity
+        .recent_people
+        .iter()
+        .filter_map(|recent| {
+            if recent.visible {
+                visible += 1;
+                if visible > limit {
+                    return None;
+                }
+            } else {
+                hidden += 1;
+                if hidden > MAX_HIDDEN_RECENT_PEOPLE {
+                    return None;
+                }
+            }
+            let profile = (*profiles_by_id.get(&recent.github_id)?).clone();
+            let trail = canonicalize_stored_trail(recent, &profiles_by_id, &profile);
+            Some(RecentPerson {
+                profile,
+                trail,
+                direction: recent.direction,
+                last_viewed_at: recent.last_viewed_at,
+                visit_count: recent.visit_count,
+                visible: recent.visible,
+            })
+        })
+        .collect();
+    ExplorationActivity {
+        recent_people,
+        max_trail_depth: activity.max_trail_depth,
+    }
 }
 
 #[async_trait]
@@ -2761,44 +3088,52 @@ impl GitHubClientPort for OctocrabGitHubClient {
             .await
             .map_err(|error| AppError::External(error.to_string()))?;
 
-        let followers: Page<GitHubApiUser> = crab
-            .get(
-                format!("/users/{login}/followers"),
-                Some(&GitHubListParams::default()),
-            )
-            .await
-            .map_err(|error| AppError::External(error.to_string()))?;
-        let followers =
-            Self::bounded_pages(&crab, followers, MAX_SOCIAL_CONNECTIONS_PER_EXPANSION).await?;
-
-        let following: Page<GitHubApiUser> = crab
-            .get(
-                format!("/users/{login}/following"),
-                Some(&GitHubListParams::default()),
-            )
-            .await
-            .map_err(|error| AppError::External(error.to_string()))?;
-        let following =
-            Self::bounded_pages(&crab, following, MAX_SOCIAL_CONNECTIONS_PER_EXPANSION).await?;
-
-        let starred: Page<octocrab::models::Repository> = crab
-            .get(
-                format!("/users/{login}/starred"),
-                Some(&GitHubListParams::default()),
-            )
-            .await
-            .map_err(|error| AppError::External(error.to_string()))?;
-        let starred = Self::bounded_pages(&crab, starred, MAX_REPOSITORIES_PER_EXPANSION).await?;
-
-        let repositories: Page<octocrab::models::Repository> = crab
-            .get(
-                format!("/users/{login}/repos"),
-                Some(&GitHubRepositoryListParams::default()),
-            )
-            .await
-            .map_err(|error| AppError::External(error.to_string()))?;
-        let repositories =
-            Self::bounded_pages(&crab, repositories, MAX_REPOSITORIES_PER_EXPANSION).await?;
+        let followers_request = async {
+            let page: Page<GitHubApiUser> = crab
+                .get(
+                    format!("/users/{login}/followers"),
+                    Some(&GitHubListParams::default()),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            Self::bounded_pages(&crab, page, MAX_SOCIAL_CONNECTIONS_PER_EXPANSION).await
+        };
+        let following_request = async {
+            let page: Page<GitHubApiUser> = crab
+                .get(
+                    format!("/users/{login}/following"),
+                    Some(&GitHubListParams::default()),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            Self::bounded_pages(&crab, page, MAX_SOCIAL_CONNECTIONS_PER_EXPANSION).await
+        };
+        let starred_request = async {
+            let page: Page<octocrab::models::Repository> = crab
+                .get(
+                    format!("/users/{login}/starred"),
+                    Some(&GitHubListParams::default()),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            Self::bounded_pages(&crab, page, MAX_REPOSITORIES_PER_EXPANSION).await
+        };
+        let repositories_request = async {
+            let page: Page<octocrab::models::Repository> = crab
+                .get(
+                    format!("/users/{login}/repos"),
+                    Some(&GitHubRepositoryListParams::default()),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            Self::bounded_pages(&crab, page, MAX_REPOSITORIES_PER_EXPANSION).await
+        };
+        let (followers, following, starred, repositories) = tokio::try_join!(
+            followers_request,
+            following_request,
+            starred_request,
+            repositories_request,
+        )?;
 
         Ok(GraphImport {
             viewer: Some(viewer.into()),
@@ -3816,6 +4151,160 @@ fn enforce_graph_capacity(
     Ok(())
 }
 
+fn neo4j_user_import_rows<'a>(
+    users: impl IntoIterator<Item = &'a GitHubUserNode>,
+) -> Vec<HashMap<String, BoltType>> {
+    let mut unique = HashMap::new();
+    for user in users {
+        unique.entry(user.github_id).or_insert(user);
+    }
+    unique
+        .into_values()
+        .map(|user| {
+            HashMap::from([
+                ("github_id".to_string(), user.github_id.into()),
+                ("login".to_string(), user.login.clone().into()),
+                (
+                    "login_key".to_string(),
+                    user.login.to_ascii_lowercase().into(),
+                ),
+                (
+                    "name".to_string(),
+                    user.name.clone().unwrap_or_default().into(),
+                ),
+                ("url".to_string(), user.url.clone().into()),
+                (
+                    "avatar_url".to_string(),
+                    user.avatar_url.clone().unwrap_or_default().into(),
+                ),
+                (
+                    "bio".to_string(),
+                    user.bio.clone().unwrap_or_default().into(),
+                ),
+                (
+                    "followers_count".to_string(),
+                    user.followers_count
+                        .and_then(|value| i64::try_from(value).ok())
+                        .unwrap_or(-1)
+                        .into(),
+                ),
+                (
+                    "following_count".to_string(),
+                    user.following_count
+                        .and_then(|value| i64::try_from(value).ok())
+                        .unwrap_or(-1)
+                        .into(),
+                ),
+                (
+                    "public_repositories_count".to_string(),
+                    user.public_repositories_count
+                        .and_then(|value| i64::try_from(value).ok())
+                        .unwrap_or(-1)
+                        .into(),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn neo4j_repository_import_rows<'a>(
+    repositories: impl IntoIterator<Item = &'a GitHubRepositoryNode>,
+) -> Vec<HashMap<String, BoltType>> {
+    let mut unique = HashMap::new();
+    for repository in repositories {
+        unique.entry(repository.github_id).or_insert(repository);
+    }
+    unique
+        .into_values()
+        .map(|repository| {
+            HashMap::from([
+                ("github_id".to_string(), repository.github_id.into()),
+                ("full_name".to_string(), repository.full_name.clone().into()),
+                (
+                    "full_name_key".to_string(),
+                    repository.full_name.to_ascii_lowercase().into(),
+                ),
+                (
+                    "owner_login".to_string(),
+                    repository.owner_login.clone().into(),
+                ),
+                ("name".to_string(), repository.name.clone().into()),
+                (
+                    "description".to_string(),
+                    repository.description.clone().unwrap_or_default().into(),
+                ),
+                ("html_url".to_string(), repository.html_url.clone().into()),
+                (
+                    "stargazer_count".to_string(),
+                    i64::try_from(repository.stargazer_count)
+                        .unwrap_or(i64::MAX)
+                        .into(),
+                ),
+                (
+                    "fork_count".to_string(),
+                    i64::try_from(repository.fork_count)
+                        .unwrap_or(i64::MAX)
+                        .into(),
+                ),
+                (
+                    "language".to_string(),
+                    repository.language.clone().unwrap_or_default().into(),
+                ),
+                ("topics".to_string(), repository.topics.clone().into()),
+                (
+                    "pushed_at".to_string(),
+                    repository
+                        .pushed_at
+                        .as_ref()
+                        .map(DateTime::to_rfc3339)
+                        .unwrap_or_default()
+                        .into(),
+                ),
+                (
+                    "updated_at".to_string(),
+                    repository
+                        .updated_at
+                        .as_ref()
+                        .map(DateTime::to_rfc3339)
+                        .unwrap_or_default()
+                        .into(),
+                ),
+                ("archived".to_string(), repository.archived.into()),
+                ("is_fork".to_string(), repository.is_fork.into()),
+            ])
+        })
+        .collect()
+}
+
+fn neo4j_contributor_import_rows(
+    contributors: &[RepositoryContributor],
+) -> Vec<HashMap<String, BoltType>> {
+    contributors
+        .iter()
+        .map(|contributor| {
+            HashMap::from([
+                ("github_id".to_string(), contributor.github_id.into()),
+                ("login".to_string(), contributor.login.clone().into()),
+                (
+                    "login_key".to_string(),
+                    contributor.login.to_ascii_lowercase().into(),
+                ),
+                ("url".to_string(), contributor.url.clone().into()),
+                (
+                    "avatar_url".to_string(),
+                    contributor.avatar_url.clone().unwrap_or_default().into(),
+                ),
+                (
+                    "contributions".to_string(),
+                    i64::try_from(contributor.contributions)
+                        .unwrap_or(i64::MAX)
+                        .into(),
+                ),
+            ])
+        })
+        .collect()
+}
+
 impl Neo4jGitHubImportRepository {
     async fn enforce_capacity_before_import(
         &self,
@@ -4050,265 +4539,157 @@ impl Neo4jGitHubImportRepository {
             .await?;
         }
 
-        for user in &import.followers {
-            run_in_transaction(
-                &mut transaction,
-                    query(
-                        "OPTIONAL MATCH (alias:User {login_key: $target_login_key})
-                         WHERE alias.github_id <> $target_id
-                         SET alias.login = '__gitexplore-user-' + toString(alias.github_id),
-                             alias.login_key = '__gitexplore-user-' + toString(alias.github_id)
-                         WITH alias
-                         OPTIONAL MATCH (alias)-[:OWNS]->(alias_repo:Repository)
-                         SET alias_repo.owner_login = alias.login
-                         WITH count(alias) AS alias_count
-                         MERGE (viewer:User {github_id: $viewer_id})
-                         SET viewer.login = $viewer_login,
-                             viewer.login_key = $viewer_login_key
-                         MERGE (target:User {github_id: $target_id})
-                         SET target.login = $target_login,
-                             target.login_key = $target_login_key,
-                             target.name = CASE WHEN $target_name = '' THEN target.name ELSE $target_name END,
-                             target.url = $target_url,
-                             target.avatar_url = CASE WHEN $target_avatar_url = '' THEN target.avatar_url ELSE $target_avatar_url END,
-                             target.bio = CASE WHEN $target_bio = '' THEN target.bio ELSE $target_bio END,
-                             target.followers_count = CASE WHEN $target_followers_count < 0 THEN target.followers_count ELSE $target_followers_count END,
-                             target.following_count = CASE WHEN $target_following_count < 0 THEN target.following_count ELSE $target_following_count END,
-                              target.public_repositories_count = CASE WHEN $target_public_repositories_count < 0 THEN target.public_repositories_count ELSE $target_public_repositories_count END
-                         WITH viewer, target
-                         OPTIONAL MATCH (target)-[:OWNS]->(target_repo:Repository)
-                         SET target_repo.owner_login = target.login
-                         WITH DISTINCT viewer, target
-                         MERGE (target)-[:FOLLOWS]->(viewer)",
-                    )
-                    .param("viewer_id", viewer.github_id)
-                    .param("viewer_login", viewer.login.clone())
-                    .param("viewer_login_key", viewer.login.to_ascii_lowercase())
-                    .param("target_login", user.login.clone())
-                    .param("target_login_key", user.login.to_ascii_lowercase())
-                    .param("target_id", user.github_id)
-                    .param("target_name", user.name.clone().unwrap_or_default())
-                    .param("target_url", user.url.clone())
-                    .param(
-                        "target_avatar_url",
-                        user.avatar_url.clone().unwrap_or_default(),
-                    )
-                    .param("target_bio", user.bio.clone().unwrap_or_default())
-                    .param(
-                        "target_followers_count",
-                        user.followers_count.map(|value| value as i64).unwrap_or(-1),
-                    )
-                    .param(
-                        "target_following_count",
-                        user.following_count.map(|value| value as i64).unwrap_or(-1),
-                    )
-                    .param(
-                        "target_public_repositories_count",
-                        user.public_repositories_count
-                            .map(|value| value as i64)
-                            .unwrap_or(-1),
-                    ),
+        let user_rows =
+            neo4j_user_import_rows(import.followers.iter().chain(import.following.iter()));
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $users AS candidate
+                 OPTIONAL MATCH (alias:User {login_key: candidate.login_key})
+                 WHERE alias.github_id <> candidate.github_id
+                 SET alias.login = '__gitexplore-user-' + toString(alias.github_id),
+                     alias.login_key = '__gitexplore-user-' + toString(alias.github_id)
+                 WITH candidate, alias
+                 OPTIONAL MATCH (alias)-[:OWNS]->(alias_repo:Repository)
+                 SET alias_repo.owner_login = alias.login
+                 WITH DISTINCT candidate
+                 MERGE (target:User {github_id: candidate.github_id})
+                 SET target.login = candidate.login,
+                     target.login_key = candidate.login_key,
+                     target.name = CASE WHEN candidate.name = '' THEN target.name ELSE candidate.name END,
+                     target.url = candidate.url,
+                     target.avatar_url = CASE WHEN candidate.avatar_url = '' THEN target.avatar_url ELSE candidate.avatar_url END,
+                     target.bio = CASE WHEN candidate.bio = '' THEN target.bio ELSE candidate.bio END,
+                     target.followers_count = CASE WHEN candidate.followers_count < 0 THEN target.followers_count ELSE candidate.followers_count END,
+                     target.following_count = CASE WHEN candidate.following_count < 0 THEN target.following_count ELSE candidate.following_count END,
+                     target.public_repositories_count = CASE WHEN candidate.public_repositories_count < 0 THEN target.public_repositories_count ELSE candidate.public_repositories_count END
+                 WITH target
+                 OPTIONAL MATCH (target)-[:OWNS]->(target_repo:Repository)
+                 SET target_repo.owner_login = target.login",
             )
-            .await?;
-        }
+            .param("users", user_rows),
+        )
+        .await?;
 
-        for user in &import.following {
-            run_in_transaction(
-                &mut transaction,
-                    query(
-                        "OPTIONAL MATCH (alias:User {login_key: $target_login_key})
-                         WHERE alias.github_id <> $target_id
-                         SET alias.login = '__gitexplore-user-' + toString(alias.github_id),
-                             alias.login_key = '__gitexplore-user-' + toString(alias.github_id)
-                         WITH alias
-                         OPTIONAL MATCH (alias)-[:OWNS]->(alias_repo:Repository)
-                         SET alias_repo.owner_login = alias.login
-                         WITH count(alias) AS alias_count
-                         MERGE (viewer:User {github_id: $viewer_id})
-                         SET viewer.login = $viewer_login,
-                             viewer.login_key = $viewer_login_key
-                         MERGE (target:User {github_id: $target_id})
-                         SET target.login = $target_login,
-                             target.login_key = $target_login_key,
-                             target.name = CASE WHEN $target_name = '' THEN target.name ELSE $target_name END,
-                             target.url = $target_url,
-                             target.avatar_url = CASE WHEN $target_avatar_url = '' THEN target.avatar_url ELSE $target_avatar_url END,
-                             target.bio = CASE WHEN $target_bio = '' THEN target.bio ELSE $target_bio END,
-                             target.followers_count = CASE WHEN $target_followers_count < 0 THEN target.followers_count ELSE $target_followers_count END,
-                             target.following_count = CASE WHEN $target_following_count < 0 THEN target.following_count ELSE $target_following_count END,
-                              target.public_repositories_count = CASE WHEN $target_public_repositories_count < 0 THEN target.public_repositories_count ELSE $target_public_repositories_count END
-                         WITH viewer, target
-                         OPTIONAL MATCH (target)-[:OWNS]->(target_repo:Repository)
-                         SET target_repo.owner_login = target.login
-                         WITH DISTINCT viewer, target
-                         MERGE (viewer)-[:FOLLOWS]->(target)",
-                    )
-                    .param("viewer_id", viewer.github_id)
-                    .param("viewer_login", viewer.login.clone())
-                    .param("viewer_login_key", viewer.login.to_ascii_lowercase())
-                    .param("target_login", user.login.clone())
-                    .param("target_login_key", user.login.to_ascii_lowercase())
-                    .param("target_id", user.github_id)
-                    .param("target_name", user.name.clone().unwrap_or_default())
-                    .param("target_url", user.url.clone())
-                    .param(
-                        "target_avatar_url",
-                        user.avatar_url.clone().unwrap_or_default(),
-                    )
-                    .param("target_bio", user.bio.clone().unwrap_or_default())
-                    .param(
-                        "target_followers_count",
-                        user.followers_count.map(|value| value as i64).unwrap_or(-1),
-                    )
-                    .param(
-                        "target_following_count",
-                        user.following_count.map(|value| value as i64).unwrap_or(-1),
-                    )
-                    .param(
-                        "target_public_repositories_count",
-                        user.public_repositories_count
-                            .map(|value| value as i64)
-                            .unwrap_or(-1),
-                    ),
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $target_ids AS target_id
+                 MATCH (viewer:User {github_id: $viewer_id})
+                 MATCH (target:User {github_id: target_id})
+                 MERGE (target)-[:FOLLOWS]->(viewer)",
             )
-            .await?;
-        }
+            .param("viewer_id", viewer.github_id)
+            .param(
+                "target_ids",
+                import
+                    .followers
+                    .iter()
+                    .map(|user| user.github_id)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await?;
 
-        for repo in &import.repositories {
-            run_in_transaction(
-                &mut transaction,
-                    query(
-                        "OPTIONAL MATCH (alias:Repository {full_name_key: $full_name_key})
-                         WHERE alias.github_id <> $repo_id
-                         SET alias.full_name = '__gitexplore-repository-' + toString(alias.github_id),
-                             alias.full_name_key = '__gitexplore-repository-' + toString(alias.github_id)
-                         WITH count(alias) AS alias_count
-                         MERGE (viewer:User {github_id: $viewer_id})
-                         SET viewer.login = $viewer_login,
-                             viewer.login_key = $viewer_login_key
-                         MERGE (repo:Repository {github_id: $repo_id})
-                         SET repo.full_name = $full_name,
-                             repo.full_name_key = $full_name_key,
-                             repo.owner_login = $owner_login,
-                             repo.name = $name,
-                             repo.description = CASE WHEN $description = '' THEN null ELSE $description END,
-                             repo.html_url = $html_url,
-                             repo.stargazer_count = $stargazer_count,
-                             repo.fork_count = $fork_count,
-                             repo.language = CASE WHEN $language = '' THEN null ELSE $language END,
-                             repo.topics = $topics,
-                             repo.pushed_at = CASE WHEN $pushed_at = '' THEN null ELSE datetime($pushed_at) END,
-                             repo.updated_at = CASE WHEN $updated_at = '' THEN null ELSE datetime($updated_at) END,
-                             repo.archived = $archived,
-                             repo.is_fork = $is_fork,
-                             repo.last_fetched_at = datetime($fetched_at),
-                             repo.stale_at = datetime($stale_at),
-                             repo.last_refresh_error = null
-                         MERGE (viewer)-[:OWNS]->(repo)",
-                    )
-                    .param("viewer_id", viewer.github_id)
-                    .param("viewer_login", viewer.login.clone())
-                    .param("viewer_login_key", viewer.login.to_ascii_lowercase())
-                    .param("full_name", repo.full_name.clone())
-                    .param("full_name_key", repo.full_name.to_ascii_lowercase())
-                    .param("repo_id", repo.github_id)
-                    .param("owner_login", repo.owner_login.clone())
-                    .param("name", repo.name.clone())
-                    .param("description", repo.description.clone().unwrap_or_default())
-                    .param("html_url", repo.html_url.clone())
-                    .param("stargazer_count", repo.stargazer_count as i64)
-                    .param("fork_count", repo.fork_count as i64)
-                    .param("language", repo.language.clone().unwrap_or_default())
-                    .param("topics", repo.topics.clone())
-                    .param(
-                        "pushed_at",
-                        repo.pushed_at
-                            .as_ref()
-                            .map(DateTime::to_rfc3339)
-                            .unwrap_or_default(),
-                    )
-                    .param(
-                        "updated_at",
-                        repo.updated_at
-                            .as_ref()
-                            .map(DateTime::to_rfc3339)
-                            .unwrap_or_default(),
-                    )
-                    .param("archived", repo.archived)
-                    .param("is_fork", repo.is_fork)
-                    .param("fetched_at", fetched_at.clone())
-                    .param("stale_at", stale_at.clone()),
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $target_ids AS target_id
+                 MATCH (viewer:User {github_id: $viewer_id})
+                 MATCH (target:User {github_id: target_id})
+                 MERGE (viewer)-[:FOLLOWS]->(target)",
             )
-            .await?;
-        }
+            .param("viewer_id", viewer.github_id)
+            .param(
+                "target_ids",
+                import
+                    .following
+                    .iter()
+                    .map(|user| user.github_id)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await?;
 
-        for repo in &import.starred_repositories {
-            run_in_transaction(
-                &mut transaction,
-                    query(
-                        "OPTIONAL MATCH (alias:Repository {full_name_key: $full_name_key})
-                         WHERE alias.github_id <> $repo_id
-                         SET alias.full_name = '__gitexplore-repository-' + toString(alias.github_id),
-                             alias.full_name_key = '__gitexplore-repository-' + toString(alias.github_id)
-                         WITH count(alias) AS alias_count
-                         MERGE (viewer:User {github_id: $viewer_id})
-                         SET viewer.login = $viewer_login,
-                             viewer.login_key = $viewer_login_key
-                         MERGE (repo:Repository {github_id: $repo_id})
-                         SET repo.full_name = $full_name,
-                             repo.full_name_key = $full_name_key,
-                             repo.owner_login = $owner_login,
-                             repo.name = $name,
-                             repo.description = CASE WHEN $description = '' THEN null ELSE $description END,
-                             repo.html_url = $html_url,
-                             repo.stargazer_count = $stargazer_count,
-                             repo.fork_count = $fork_count,
-                             repo.language = CASE WHEN $language = '' THEN null ELSE $language END,
-                             repo.topics = $topics,
-                             repo.pushed_at = CASE WHEN $pushed_at = '' THEN null ELSE datetime($pushed_at) END,
-                             repo.updated_at = CASE WHEN $updated_at = '' THEN null ELSE datetime($updated_at) END,
-                             repo.archived = $archived,
-                             repo.is_fork = $is_fork,
-                             repo.last_fetched_at = datetime($fetched_at),
-                             repo.stale_at = datetime($stale_at),
-                             repo.last_refresh_error = null
-                         MERGE (viewer)-[:STARRED]->(repo)",
-                    )
-                    .param("viewer_id", viewer.github_id)
-                    .param("viewer_login", viewer.login.clone())
-                    .param("viewer_login_key", viewer.login.to_ascii_lowercase())
-                    .param("full_name", repo.full_name.clone())
-                    .param("full_name_key", repo.full_name.to_ascii_lowercase())
-                    .param("repo_id", repo.github_id)
-                    .param("owner_login", repo.owner_login.clone())
-                    .param("name", repo.name.clone())
-                    .param("description", repo.description.clone().unwrap_or_default())
-                    .param("html_url", repo.html_url.clone())
-                    .param("stargazer_count", repo.stargazer_count as i64)
-                    .param("fork_count", repo.fork_count as i64)
-                    .param("language", repo.language.clone().unwrap_or_default())
-                    .param("topics", repo.topics.clone())
-                    .param(
-                        "pushed_at",
-                        repo.pushed_at
-                            .as_ref()
-                            .map(DateTime::to_rfc3339)
-                            .unwrap_or_default(),
-                    )
-                    .param(
-                        "updated_at",
-                        repo.updated_at
-                            .as_ref()
-                            .map(DateTime::to_rfc3339)
-                            .unwrap_or_default(),
-                    )
-                    .param("archived", repo.archived)
-                    .param("is_fork", repo.is_fork)
-                    .param("fetched_at", fetched_at.clone())
-                    .param("stale_at", stale_at.clone()),
+        let repository_rows = neo4j_repository_import_rows(
+            import
+                .repositories
+                .iter()
+                .chain(import.starred_repositories.iter()),
+        );
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $repositories AS candidate
+                 OPTIONAL MATCH (alias:Repository {full_name_key: candidate.full_name_key})
+                 WHERE alias.github_id <> candidate.github_id
+                 SET alias.full_name = '__gitexplore-repository-' + toString(alias.github_id),
+                     alias.full_name_key = '__gitexplore-repository-' + toString(alias.github_id)
+                 WITH DISTINCT candidate
+                 MERGE (repo:Repository {github_id: candidate.github_id})
+                 SET repo.full_name = candidate.full_name,
+                     repo.full_name_key = candidate.full_name_key,
+                     repo.owner_login = candidate.owner_login,
+                     repo.name = candidate.name,
+                     repo.description = CASE WHEN candidate.description = '' THEN null ELSE candidate.description END,
+                     repo.html_url = candidate.html_url,
+                     repo.stargazer_count = candidate.stargazer_count,
+                     repo.fork_count = candidate.fork_count,
+                     repo.language = CASE WHEN candidate.language = '' THEN null ELSE candidate.language END,
+                     repo.topics = candidate.topics,
+                     repo.pushed_at = CASE WHEN candidate.pushed_at = '' THEN null ELSE datetime(candidate.pushed_at) END,
+                     repo.updated_at = CASE WHEN candidate.updated_at = '' THEN null ELSE datetime(candidate.updated_at) END,
+                     repo.archived = candidate.archived,
+                     repo.is_fork = candidate.is_fork,
+                     repo.last_fetched_at = datetime($fetched_at),
+                     repo.stale_at = datetime($stale_at),
+                     repo.last_refresh_error = null",
             )
-            .await?;
-        }
+            .param("repositories", repository_rows)
+            .param("fetched_at", fetched_at.clone())
+            .param("stale_at", stale_at.clone()),
+        )
+        .await?;
+
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $repository_ids AS repository_id
+                 MATCH (viewer:User {github_id: $viewer_id})
+                 MATCH (repo:Repository {github_id: repository_id})
+                 MERGE (viewer)-[:OWNS]->(repo)",
+            )
+            .param("viewer_id", viewer.github_id)
+            .param(
+                "repository_ids",
+                import
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.github_id)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await?;
+
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $repository_ids AS repository_id
+                 MATCH (viewer:User {github_id: $viewer_id})
+                 MATCH (repo:Repository {github_id: repository_id})
+                 MERGE (viewer)-[:STARRED]->(repo)",
+            )
+            .param("viewer_id", viewer.github_id)
+            .param(
+                "repository_ids",
+                import
+                    .starred_repositories
+                    .iter()
+                    .map(|repository| repository.github_id)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await?;
 
         let summary = SyncSummary {
             followers: import.followers.len(),
@@ -5462,9 +5843,10 @@ impl Neo4jExplorationRepository {
 #[async_trait]
 impl DiscoveryRepository for Neo4jDiscoveryRepository {
     async fn user_neighborhood(&self, user_id: &str, login: &str) -> AppResult<UserNeighborhood> {
-        let (user, coverage) = self.discovery_user(login).await?;
-        let mut followers = self
-            .related_users(
+        let login_key = login.to_ascii_lowercase();
+        let (user_and_coverage, mut followers, mut following, repositories) = tokio::try_join!(
+            self.discovery_user(login),
+            self.related_users(
                 query(
                     "MATCH (viewer:User)
                      WHERE viewer.login_key = $login_key
@@ -5482,11 +5864,9 @@ impl DiscoveryRepository for Neo4jDiscoveryRepository {
                             toString(related.neighborhood_stale_at) AS neighborhood_stale_at
                      ORDER BY related.login ASC",
                 )
-                .param("login_key", login.to_ascii_lowercase()),
-            )
-            .await?;
-        let mut following = self
-            .related_users(
+                .param("login_key", login_key.clone()),
+            ),
+            self.related_users(
                 query(
                     "MATCH (viewer:User)
                      WHERE viewer.login_key = $login_key
@@ -5504,73 +5884,14 @@ impl DiscoveryRepository for Neo4jDiscoveryRepository {
                             toString(related.neighborhood_stale_at) AS neighborhood_stale_at
                      ORDER BY related.login ASC",
                 )
-                .param("login_key", login.to_ascii_lowercase()),
-            )
-            .await?;
+                .param("login_key", login_key),
+            ),
+            self.related_repositories(user_id, login),
+        )?;
+        let (user, coverage) = user_and_coverage;
+        let (starred_repositories, owned_repositories) = repositories;
         followers.dedup_by(|left, right| left.profile.login == right.profile.login);
         following.dedup_by(|left, right| left.profile.login == right.profile.login);
-
-        let mut rows = self
-            .client
-            .graph
-            .execute_on(
-                &self.client.database,
-                query(
-                    "MATCH (viewer:User)
-                     WHERE viewer.login_key = $login_key
-                     MATCH (viewer)-[relationship:STARRED|OWNS|MEMBER_OF]->(repo:Repository)
-                     RETURN repo.github_id AS github_id,
-                            repo.owner_login AS owner_login,
-                            repo.name AS name,
-                            repo.full_name AS full_name,
-                            repo.description AS description,
-                            repo.html_url AS html_url,
-                            repo.stargazer_count AS stargazer_count,
-                            repo.fork_count AS fork_count,
-                            repo.language AS language,
-                            repo.topics AS topics,
-                            toString(repo.pushed_at) AS pushed_at,
-                            toString(repo.updated_at) AS updated_at,
-                            repo.archived AS archived,
-                            repo.is_fork AS is_fork,
-                            type(relationship) AS relationship_kind,
-                            EXISTS {
-                                MATCH (:LocalUser {id: $user_id})-[:CREATED_BOOKMARK]->(:Bookmark)-[:TARGETS_REPO]->(repo)
-                            } AS saved
-                     ORDER BY repo.full_name ASC",
-                )
-                .param("login_key", login.to_ascii_lowercase())
-                .param("user_id", user_id.to_string()),
-            )
-            .await
-            .map_err(|error| AppError::External(error.to_string()))?;
-
-        let mut starred_repositories = Vec::new();
-        let mut owned_repositories = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| AppError::External(error.to_string()))?
-        {
-            let relationship_kind = row
-                .get::<String>("relationship_kind")
-                .map_err(map_neo4j_decode)?;
-            let record = DiscoveryRepositoryRecord {
-                repository: decode_repository_node(&row)?,
-                saved: row.get::<bool>("saved").map_err(map_neo4j_decode)?,
-            };
-            if relationship_kind == "STARRED" {
-                starred_repositories.push(record);
-            } else {
-                owned_repositories.push(record);
-            }
-        }
-        sort_repository_records(&mut starred_repositories);
-        sort_repository_records(&mut owned_repositories);
-        starred_repositories
-            .dedup_by(|left, right| left.repository.github_id == right.repository.github_id);
-        owned_repositories
-            .dedup_by(|left, right| left.repository.github_id == right.repository.github_id);
 
         Ok(UserNeighborhood {
             user,
@@ -5588,14 +5909,7 @@ impl DiscoveryRepository for Neo4jDiscoveryRepository {
         login: &str,
         limit: usize,
     ) -> AppResult<Vec<RepositoryCandidate>> {
-        let neighborhood = self.user_neighborhood(user_id, login).await?;
-        let preferred_languages = neighborhood
-            .starred_repositories
-            .iter()
-            .chain(neighborhood.owned_repositories.iter())
-            .filter_map(|record| record.repository.language.as_ref())
-            .map(|language| language.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
+        let preferred_languages = self.preferred_languages(login).await?;
 
         let mut rows = self
             .client
@@ -5697,6 +6011,307 @@ impl DiscoveryRepository for Neo4jDiscoveryRepository {
         sort_repository_candidates(&mut ranked);
         ranked.truncate(limit);
         Ok(ranked)
+    }
+
+    async fn exploration_activity(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> AppResult<ExplorationActivity> {
+        let mut depth_rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (local:LocalUser {id: $user_id})
+                     RETURN coalesce(local.exploration_max_depth, 0) AS max_trail_depth",
+                )
+                .param("user_id", user_id.to_string()),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let max_trail_depth = match depth_rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        {
+            Some(row) => usize::try_from(
+                row.get::<i64>("max_trail_depth")
+                    .map_err(map_neo4j_decode)?,
+            )
+            .unwrap_or_default(),
+            None => 0,
+        };
+
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (:LocalUser {id: $user_id})-[visit:RECENTLY_VIEWED]->(person:User)
+                     WITH person, visit
+                     ORDER BY visit.last_viewed_at DESC, elementId(visit) ASC
+                     LIMIT $read_limit
+                     OPTIONAL MATCH (hop:User)
+                     WHERE hop.github_id IN coalesce(visit.trail_github_ids, [])
+                     WITH person, visit,
+                          collect(DISTINCT CASE WHEN hop IS NULL THEN null ELSE {
+                              github_id: hop.github_id,
+                              login: hop.login
+                          } END) AS canonical_hops
+                     RETURN person.github_id AS github_id,
+                            person.login AS login,
+                            person.name AS name,
+                            person.url AS url,
+                            person.avatar_url AS avatar_url,
+                            person.bio AS bio,
+                            person.followers_count AS followers_count,
+                            person.following_count AS following_count,
+                            person.public_repositories_count AS public_repositories_count,
+                            toString(person.neighborhood_last_fetched_at) AS neighborhood_last_fetched_at,
+                            toString(person.neighborhood_stale_at) AS neighborhood_stale_at,
+                            coalesce(visit.trail, []) AS legacy_trail,
+                            coalesce(visit.trail_github_ids, []) AS trail_github_ids,
+                            canonical_hops,
+                            visit.direction AS direction,
+                            toString(visit.last_viewed_at) AS last_viewed_at,
+                            coalesce(visit.visit_count, 1) AS visit_count,
+                            coalesce(visit.visible, true) AS visible
+                     ORDER BY visit.last_viewed_at DESC, elementId(visit) ASC",
+                )
+                .param("user_id", user_id.to_string())
+                .param(
+                    "read_limit",
+                    i64::try_from(limit.saturating_add(MAX_HIDDEN_RECENT_PEOPLE))
+                        .unwrap_or(i64::MAX),
+                ),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let mut recent_people = Vec::new();
+        let mut visible_count = 0usize;
+        let mut hidden_count = 0usize;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        {
+            let visible = row.get::<bool>("visible").map_err(map_neo4j_decode)?;
+            if visible {
+                visible_count += 1;
+                if visible_count > limit {
+                    continue;
+                }
+            } else {
+                hidden_count += 1;
+                if hidden_count > MAX_HIDDEN_RECENT_PEOPLE {
+                    continue;
+                }
+            }
+            let direction = match row
+                .get::<String>("direction")
+                .map_err(map_neo4j_decode)?
+                .as_str()
+            {
+                "following" => ExplorationDirection::Following,
+                _ => ExplorationDirection::Followers,
+            };
+            let profile = decode_discovery_user(&row)?.profile;
+            let trail_github_ids = row
+                .get::<Vec<i64>>("trail_github_ids")
+                .map_err(map_neo4j_decode)?;
+            let legacy_trail = row
+                .get::<Vec<String>>("legacy_trail")
+                .map_err(map_neo4j_decode)?;
+            let canonical_hops = row
+                .get::<Vec<CanonicalTrailHop>>("canonical_hops")
+                .map_err(map_neo4j_decode)?;
+            let trail = canonicalize_neo4j_trail(
+                &trail_github_ids,
+                &legacy_trail,
+                canonical_hops,
+                &profile,
+            );
+            recent_people.push(RecentPerson {
+                profile,
+                trail,
+                direction,
+                last_viewed_at: parse_required_timestamp(
+                    &row.get::<String>("last_viewed_at")
+                        .map_err(map_neo4j_decode)?,
+                )?,
+                visit_count: u64::try_from(
+                    row.get::<i64>("visit_count").map_err(map_neo4j_decode)?,
+                )
+                .unwrap_or_default(),
+                visible,
+            });
+        }
+        Ok(ExplorationActivity {
+            recent_people,
+            max_trail_depth,
+        })
+    }
+
+    async fn record_person_visit(
+        &self,
+        user_id: &str,
+        login: &str,
+        trail: Vec<String>,
+        direction: ExplorationDirection,
+    ) -> AppResult<ExplorationActivity> {
+        let now = Utc::now();
+        let direction = match direction {
+            ExplorationDirection::Followers => "followers",
+            ExplorationDirection::Following => "following",
+        };
+        let mut transaction = self
+            .client
+            .graph
+            .start_txn_on(self.client.database.clone())
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let operation = async {
+            let resolved_trail = self
+                .resolve_and_validate_exploration_trail(&mut transaction, &trail)
+                .await?;
+            let Some(target_github_id) = resolved_trail.github_ids.last().copied() else {
+                return Err(AppError::Validation(
+                    "exploration trail cannot be empty".to_string(),
+                ));
+            };
+            let target_login = resolved_trail
+                .logins
+                .last()
+                .expect("resolved exploration trail is non-empty");
+            if !target_login.eq_ignore_ascii_case(login) {
+                return Err(AppError::Validation(
+                    "exploration trail must end at the visited person".to_string(),
+                ));
+            }
+            let trail_depth = i64::try_from(resolved_trail.github_ids.len().saturating_sub(1))
+                .unwrap_or(i64::MAX);
+            let mut rows = transaction
+                .execute(
+                    query(
+                        "MATCH (person:User {github_id: $github_id})
+                         MERGE (local:LocalUser {id: $user_id})
+                         MERGE (local)-[visit:RECENTLY_VIEWED]->(person)
+                         ON CREATE SET visit.visible = true,
+                                       visit.first_viewed_at = datetime($viewed_at),
+                                       visit.visit_count = 0
+                         SET visit.trail = $trail,
+                             visit.trail_github_ids = $trail_github_ids,
+                             visit.direction = $direction,
+                             visit.last_viewed_at = datetime($viewed_at),
+                             visit.visit_count = coalesce(visit.visit_count, 0) + 1,
+                             local.exploration_max_depth =
+                               CASE WHEN coalesce(local.exploration_max_depth, 0) < $trail_depth
+                                 THEN $trail_depth
+                                 ELSE coalesce(local.exploration_max_depth, 0)
+                               END
+                         RETURN person.github_id AS github_id",
+                    )
+                    .param("github_id", target_github_id)
+                    .param("user_id", user_id.to_string())
+                    .param("trail", resolved_trail.logins)
+                    .param("trail_github_ids", resolved_trail.github_ids)
+                    .param("direction", direction)
+                    .param("viewed_at", now.to_rfc3339())
+                    .param("trail_depth", trail_depth),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            if rows
+                .next(&mut transaction)
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?
+                .is_none()
+            {
+                return Err(AppError::NotFound(format!(
+                    "github user `{login}` is not present in the shared graph"
+                )));
+            }
+            drop(rows);
+            self.prune_exploration_activity_in_transaction(&mut transaction, user_id)
+                .await
+        }
+        .await;
+        if let Err(error) = operation {
+            if let Err(rollback_error) = transaction.rollback().await {
+                tracing::warn!(
+                    %rollback_error,
+                    "failed to explicitly roll back Neo4j exploration activity"
+                );
+            }
+            return Err(error);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        self.exploration_activity(user_id, MAX_RECENT_PEOPLE).await
+    }
+
+    async fn set_recent_person_visible(
+        &self,
+        user_id: &str,
+        login: &str,
+        visible: bool,
+    ) -> AppResult<ExplorationActivity> {
+        let mut transaction = self
+            .client
+            .graph
+            .start_txn_on(self.client.database.clone())
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let operation = async {
+            let mut rows = transaction
+                .execute(
+                    query(
+                        "MATCH (local:LocalUser {id: $user_id})-[visit:RECENTLY_VIEWED]->(person:User {login_key: $login_key})
+                         SET visit.visible = $visible,
+                             visit.last_viewed_at = datetime($viewed_at)
+                         RETURN person.github_id AS github_id",
+                    )
+                    .param("user_id", user_id.to_string())
+                    .param("login_key", login.to_ascii_lowercase())
+                    .param("visible", visible)
+                    .param("viewed_at", Utc::now().to_rfc3339()),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            if rows
+                .next(&mut transaction)
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?
+                .is_none()
+            {
+                return Err(AppError::NotFound(
+                    "recent person was not recorded".to_string(),
+                ));
+            }
+            drop(rows);
+            self.prune_exploration_activity_in_transaction(&mut transaction, user_id)
+                .await
+        }
+        .await;
+        if let Err(error) = operation {
+            if let Err(rollback_error) = transaction.rollback().await {
+                tracing::warn!(
+                    %rollback_error,
+                    "failed to explicitly roll back Neo4j recent-person visibility"
+                );
+            }
+            return Err(error);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        self.exploration_activity(user_id, MAX_RECENT_PEOPLE).await
     }
 }
 
@@ -5915,6 +6530,7 @@ impl InsightRepository for Neo4jInsightRepository {
         &self,
         insights: RepositoryContributorInsights,
     ) -> AppResult<()> {
+        let contributor_rows = neo4j_contributor_import_rows(&insights.contributors);
         let mut transaction = self
             .client
             .graph
@@ -5952,41 +6568,35 @@ impl InsightRepository for Neo4jInsightRepository {
             .param("full_name_key", insights.full_name.to_ascii_lowercase()),
         )
         .await?;
-        for contributor in insights.contributors {
-            run_in_transaction(
-                &mut transaction,
-                query(
-                    "OPTIONAL MATCH (alias:User {login_key: $login_key})
-                     WHERE alias.github_id <> $github_id
-                     SET alias.login = '__gitexplore-user-' + toString(alias.github_id),
-                         alias.login_key = '__gitexplore-user-' + toString(alias.github_id)
-                     WITH alias
-                     OPTIONAL MATCH (alias)-[:OWNS]->(alias_repo:Repository)
-                     SET alias_repo.owner_login = alias.login
-                     WITH count(alias) AS alias_count
-                     MERGE (contributor:User {github_id: $github_id})
-                     SET contributor.login = $login,
-                         contributor.login_key = $login_key,
-                         contributor.url = $url,
-                         contributor.avatar_url = CASE WHEN $avatar_url = '' THEN contributor.avatar_url ELSE $avatar_url END
-                     WITH contributor
-                     OPTIONAL MATCH (contributor)-[:OWNS]->(owned:Repository)
-                     SET owned.owner_login = contributor.login
-                     WITH DISTINCT contributor
-                     MATCH (repo:Repository {full_name_key: $full_name_key})
-                     MERGE (contributor)-[activity:CONTRIBUTED_TO]->(repo)
-                     SET activity.contributions = $contributions",
-                )
-                .param("full_name_key", insights.full_name.to_ascii_lowercase())
-                .param("github_id", contributor.github_id)
-                .param("login", contributor.login.clone())
-                .param("login_key", contributor.login.to_ascii_lowercase())
-                .param("url", contributor.url)
-                .param("avatar_url", contributor.avatar_url.unwrap_or_default())
-                .param("contributions", contributor.contributions as i64),
+        run_in_transaction(
+            &mut transaction,
+            query(
+                "UNWIND $contributors AS candidate
+                 OPTIONAL MATCH (alias:User {login_key: candidate.login_key})
+                 WHERE alias.github_id <> candidate.github_id
+                 SET alias.login = '__gitexplore-user-' + toString(alias.github_id),
+                     alias.login_key = '__gitexplore-user-' + toString(alias.github_id)
+                 WITH candidate, alias
+                 OPTIONAL MATCH (alias)-[:OWNS]->(alias_repo:Repository)
+                 SET alias_repo.owner_login = alias.login
+                 WITH DISTINCT candidate
+                 MERGE (contributor:User {github_id: candidate.github_id})
+                 SET contributor.login = candidate.login,
+                     contributor.login_key = candidate.login_key,
+                     contributor.url = candidate.url,
+                     contributor.avatar_url = CASE WHEN candidate.avatar_url = '' THEN contributor.avatar_url ELSE candidate.avatar_url END
+                 WITH contributor, candidate
+                 OPTIONAL MATCH (contributor)-[:OWNS]->(owned:Repository)
+                 SET owned.owner_login = contributor.login
+                 WITH DISTINCT contributor, candidate
+                 MATCH (repo:Repository {full_name_key: $full_name_key})
+                 MERGE (contributor)-[activity:CONTRIBUTED_TO]->(repo)
+                 SET activity.contributions = candidate.contributions",
             )
-            .await?;
-        }
+            .param("full_name_key", insights.full_name.to_ascii_lowercase())
+            .param("contributors", contributor_rows),
+        )
+        .await?;
         transaction
             .commit()
             .await
@@ -6162,6 +6772,161 @@ fn required_cache_timestamp(timestamp: Option<DateTime<Utc>>, field: &str) -> Ap
 }
 
 impl Neo4jDiscoveryRepository {
+    async fn resolve_and_validate_exploration_trail(
+        &self,
+        transaction: &mut Txn,
+        trail: &[String],
+    ) -> AppResult<ResolvedExplorationTrail> {
+        if trail.is_empty() {
+            return Err(AppError::Validation(
+                "exploration trail cannot be empty".to_string(),
+            ));
+        }
+        let normalized_trail = trail
+            .iter()
+            .map(|login| login.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let mut rows = transaction
+            .execute(
+                query(
+                    "UNWIND range(0, size($trail) - 1) AS hop_index
+                     OPTIONAL MATCH (hop:User {login_key: $trail[hop_index]})
+                     RETURN hop_index,
+                            hop.github_id AS github_id,
+                            hop.login AS login
+                     ORDER BY hop_index ASC",
+                )
+                .param("trail", normalized_trail),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let mut github_ids = Vec::with_capacity(trail.len());
+        let mut logins = Vec::with_capacity(trail.len());
+        while let Some(row) = rows
+            .next(&mut *transaction)
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        {
+            let index = usize::try_from(row.get::<i64>("hop_index").map_err(map_neo4j_decode)?)
+                .unwrap_or(usize::MAX);
+            let github_id = row
+                .get::<Option<i64>>("github_id")
+                .map_err(map_neo4j_decode)?;
+            let login = row
+                .get::<Option<String>>("login")
+                .map_err(map_neo4j_decode)?;
+            let (Some(github_id), Some(login)) = (github_id, login) else {
+                let missing = trail.get(index).map_or("unknown", String::as_str);
+                if index + 1 == trail.len() {
+                    return Err(AppError::NotFound(format!(
+                        "github user `{missing}` is not present in the shared graph"
+                    )));
+                }
+                return Err(AppError::Validation(format!(
+                    "exploration trail contains unknown github user `{missing}`"
+                )));
+            };
+            github_ids.push(github_id);
+            logins.push(login);
+        }
+        drop(rows);
+
+        if github_ids.len() != trail.len() {
+            return Err(AppError::Storage(
+                "Neo4j exploration trail resolution returned an incomplete result".to_string(),
+            ));
+        }
+        if github_ids.iter().copied().collect::<HashSet<_>>().len() != github_ids.len() {
+            return Err(AppError::Validation(
+                "exploration trail cannot repeat a person".to_string(),
+            ));
+        }
+
+        if github_ids.len() > 1 {
+            let mut rows = transaction
+                .execute(
+                    query(
+                        "UNWIND range(0, size($trail_ids) - 2) AS hop_index
+                         MATCH (left:User {github_id: $trail_ids[hop_index]})
+                         MATCH (right:User {github_id: $trail_ids[hop_index + 1]})
+                         RETURN hop_index,
+                                left.login AS left_login,
+                                right.login AS right_login,
+                                EXISTS { MATCH (left)-[:FOLLOWS]->(right) }
+                                  OR EXISTS { MATCH (right)-[:FOLLOWS]->(left) } AS connected
+                         ORDER BY hop_index ASC",
+                    )
+                    .param("trail_ids", github_ids.clone()),
+                )
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?;
+            let mut checked_pairs = 0usize;
+            while let Some(row) = rows
+                .next(&mut *transaction)
+                .await
+                .map_err(|error| AppError::External(error.to_string()))?
+            {
+                checked_pairs += 1;
+                if !row.get::<bool>("connected").map_err(map_neo4j_decode)? {
+                    return Err(AppError::Validation(format!(
+                        "exploration trail hop `{}` -> `{}` is not present in the shared graph",
+                        row.get::<String>("left_login").map_err(map_neo4j_decode)?,
+                        row.get::<String>("right_login").map_err(map_neo4j_decode)?
+                    )));
+                }
+            }
+            drop(rows);
+            if checked_pairs != github_ids.len() - 1 {
+                return Err(AppError::Storage(
+                    "Neo4j exploration trail validation returned an incomplete result".to_string(),
+                ));
+            }
+        }
+
+        Ok(ResolvedExplorationTrail { github_ids, logins })
+    }
+
+    async fn prune_exploration_activity_in_transaction(
+        &self,
+        transaction: &mut Txn,
+        user_id: &str,
+    ) -> AppResult<()> {
+        run_in_transaction(
+            transaction,
+            query(
+                "MATCH (:LocalUser {id: $user_id})-[visit:RECENTLY_VIEWED]->(:User)
+                 WHERE coalesce(visit.visible, true)
+                 WITH visit
+                 ORDER BY visit.last_viewed_at DESC, elementId(visit) ASC
+                 SKIP $retained
+                 DELETE visit",
+            )
+            .param("user_id", user_id.to_string())
+            .param(
+                "retained",
+                i64::try_from(MAX_RECENT_PEOPLE).unwrap_or(i64::MAX),
+            ),
+        )
+        .await?;
+        run_in_transaction(
+            transaction,
+            query(
+                "MATCH (:LocalUser {id: $user_id})-[visit:RECENTLY_VIEWED]->(:User)
+                 WHERE NOT coalesce(visit.visible, true)
+                 WITH visit
+                 ORDER BY visit.last_viewed_at DESC, elementId(visit) ASC
+                 SKIP $retained
+                 DELETE visit",
+            )
+            .param("user_id", user_id.to_string())
+            .param(
+                "retained",
+                i64::try_from(MAX_HIDDEN_RECENT_PEOPLE).unwrap_or(i64::MAX),
+            ),
+        )
+        .await
+    }
+
     async fn discovery_user(&self, login: &str) -> AppResult<(DiscoveryUser, GraphImportCoverage)> {
         let mut rows = self
             .client
@@ -6238,6 +7003,107 @@ impl Neo4jDiscoveryRepository {
             users.push(decode_discovery_user(&row)?);
         }
         Ok(users)
+    }
+
+    async fn related_repositories(
+        &self,
+        user_id: &str,
+        login: &str,
+    ) -> AppResult<(
+        Vec<DiscoveryRepositoryRecord>,
+        Vec<DiscoveryRepositoryRecord>,
+    )> {
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (viewer:User)
+                     WHERE viewer.login_key = $login_key
+                     MATCH (viewer)-[relationship:STARRED|OWNS|MEMBER_OF]->(repo:Repository)
+                     RETURN repo.github_id AS github_id,
+                            repo.owner_login AS owner_login,
+                            repo.name AS name,
+                            repo.full_name AS full_name,
+                            repo.description AS description,
+                            repo.html_url AS html_url,
+                            repo.stargazer_count AS stargazer_count,
+                            repo.fork_count AS fork_count,
+                            repo.language AS language,
+                            repo.topics AS topics,
+                            toString(repo.pushed_at) AS pushed_at,
+                            toString(repo.updated_at) AS updated_at,
+                            repo.archived AS archived,
+                            repo.is_fork AS is_fork,
+                            type(relationship) AS relationship_kind,
+                            EXISTS {
+                                MATCH (:LocalUser {id: $user_id})-[:CREATED_BOOKMARK]->(:Bookmark)-[:TARGETS_REPO]->(repo)
+                            } AS saved
+                     ORDER BY repo.full_name ASC",
+                )
+                .param("login_key", login.to_ascii_lowercase())
+                .param("user_id", user_id.to_string()),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+
+        let mut starred_repositories = Vec::new();
+        let mut owned_repositories = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        {
+            let relationship_kind = row
+                .get::<String>("relationship_kind")
+                .map_err(map_neo4j_decode)?;
+            let record = DiscoveryRepositoryRecord {
+                repository: decode_repository_node(&row)?,
+                saved: row.get::<bool>("saved").map_err(map_neo4j_decode)?,
+            };
+            if relationship_kind == "STARRED" {
+                starred_repositories.push(record);
+            } else {
+                owned_repositories.push(record);
+            }
+        }
+        sort_repository_records(&mut starred_repositories);
+        sort_repository_records(&mut owned_repositories);
+        starred_repositories
+            .dedup_by(|left, right| left.repository.github_id == right.repository.github_id);
+        owned_repositories
+            .dedup_by(|left, right| left.repository.github_id == right.repository.github_id);
+        Ok((starred_repositories, owned_repositories))
+    }
+
+    async fn preferred_languages(&self, login: &str) -> AppResult<HashSet<String>> {
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (:User {login_key: $login_key})-[:STARRED|OWNS|MEMBER_OF]->(repo:Repository)
+                     WHERE repo.language IS NOT NULL
+                     RETURN collect(DISTINCT toLower(repo.language)) AS preferred_languages",
+                )
+                .param("login_key", login.to_ascii_lowercase()),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        else {
+            return Ok(HashSet::new());
+        };
+        Ok(row
+            .get::<Vec<String>>("preferred_languages")
+            .map_err(map_neo4j_decode)?
+            .into_iter()
+            .collect())
     }
 }
 
@@ -6625,6 +7491,598 @@ mod tests {
     use super::*;
 
     const TEST_IDENTITY_KEY: &str = "HC7oBiY2DcgwFPFOplgK1nk77uOQV7x__mLWuIEBFz4";
+
+    #[tokio::test]
+    async fn local_exploration_activity_keeps_routes_visibility_and_monotonic_rank_private() {
+        let repositories = LocalRepositorySet::in_memory();
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 1,
+                        login: "alice".to_string(),
+                        url: "https://github.com/alice".to_string(),
+                        ..Default::default()
+                    }),
+                    followers: vec![
+                        GitHubUserNode {
+                            github_id: 2,
+                            login: "bob".to_string(),
+                            url: "https://github.com/bob".to_string(),
+                            ..Default::default()
+                        },
+                        GitHubUserNode {
+                            github_id: 3,
+                            login: "carol".to_string(),
+                            url: "https://github.com/carol".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed shared users");
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 2,
+                        login: "bob".to_string(),
+                        url: "https://github.com/bob".to_string(),
+                        ..Default::default()
+                    }),
+                    following: vec![
+                        GitHubUserNode {
+                            github_id: 1,
+                            login: "alice".to_string(),
+                            url: "https://github.com/alice".to_string(),
+                            ..Default::default()
+                        },
+                        GitHubUserNode {
+                            github_id: 3,
+                            login: "carol".to_string(),
+                            url: "https://github.com/carol".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connect the saved breadcrumb route");
+
+        repositories
+            .discovery
+            .record_person_visit(
+                "owner",
+                "bob",
+                vec!["alice".to_string(), "bob".to_string()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("record bob");
+        let activity = repositories
+            .discovery
+            .record_person_visit(
+                "owner",
+                "carol",
+                vec!["alice".to_string(), "bob".to_string(), "carol".to_string()],
+                ExplorationDirection::Following,
+            )
+            .await
+            .expect("record carol");
+        assert_eq!(activity.max_trail_depth, 2);
+        assert_eq!(activity.recent_people[0].profile.login, "carol");
+        assert_eq!(activity.recent_people[0].trail.len(), 3);
+
+        let activity = repositories
+            .discovery
+            .record_person_visit(
+                "owner",
+                "BOB",
+                vec!["bob".to_string()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("move bob to the front");
+        assert_eq!(activity.recent_people[0].profile.github_id, 2);
+        assert_eq!(activity.recent_people[0].visit_count, 2);
+        assert_eq!(
+            activity.max_trail_depth, 2,
+            "shallower visits never demote rank"
+        );
+
+        let hidden = repositories
+            .discovery
+            .set_recent_person_visible("owner", "bob", false)
+            .await
+            .expect("hide bob");
+        assert!(!hidden.recent_people[0].visible);
+        assert_eq!(hidden.max_trail_depth, 2);
+
+        let hidden_after_revisit = repositories
+            .discovery
+            .record_person_visit(
+                "owner",
+                "bob",
+                vec!["alice".to_string(), "bob".to_string()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("revisit hidden bob");
+        assert!(
+            !hidden_after_revisit.recent_people[0].visible,
+            "automatic recording must preserve an explicit removal"
+        );
+        let restored = repositories
+            .discovery
+            .set_recent_person_visible("owner", "bob", true)
+            .await
+            .expect("restore bob");
+        assert!(restored.recent_people[0].visible);
+
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 2,
+                        login: "robert".to_string(),
+                        url: "https://github.com/robert".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist GitHub rename");
+        let renamed = repositories
+            .discovery
+            .exploration_activity("owner", MAX_RECENT_PEOPLE)
+            .await
+            .expect("load renamed recent person");
+        assert_eq!(renamed.recent_people[0].profile.login, "robert");
+        assert_eq!(renamed.recent_people[0].trail, ["alice", "robert"]);
+        let carol = renamed
+            .recent_people
+            .iter()
+            .find(|recent| recent.profile.login == "carol")
+            .expect("carol remains in recents");
+        assert_eq!(carol.trail, ["alice", "robert", "carol"]);
+
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 4,
+                        login: "dave".to_string(),
+                        url: "https://github.com/dave".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed an unconnected user");
+
+        let other_user = repositories
+            .discovery
+            .exploration_activity("someone-else", MAX_RECENT_PEOPLE)
+            .await
+            .expect("read isolated activity");
+        assert!(other_user.recent_people.is_empty());
+        assert_eq!(other_user.max_trail_depth, 0);
+
+        assert!(matches!(
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    "unknown",
+                    vec!["unknown".to_string()],
+                    ExplorationDirection::Followers,
+                )
+                .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    "robert",
+                    vec![
+                        "alice".to_string(),
+                        "missing".to_string(),
+                        "robert".to_string(),
+                    ],
+                    ExplorationDirection::Followers,
+                )
+                .await,
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    "dave",
+                    vec!["robert".to_string(), "dave".to_string()],
+                    ExplorationDirection::Followers,
+                )
+                .await,
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    "alice",
+                    vec![
+                        "alice".to_string(),
+                        "robert".to_string(),
+                        "alice".to_string(),
+                    ],
+                    ExplorationDirection::Followers,
+                )
+                .await,
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_exploration_activity_survives_store_reopen() {
+        let temp = tempfile::tempdir().expect("temporary graph directory");
+        let graph_path = temp.path().join("graph.json");
+        {
+            let store =
+                Arc::new(LocalGraphStore::from_file(graph_path.clone()).expect("open store"));
+            let imports = LocalGitHubImportRepository {
+                store: store.clone(),
+            };
+            let discovery = LocalDiscoveryRepository { store };
+            imports
+                .import_github_graph(
+                    "owner",
+                    GraphImport {
+                        viewer: Some(GitHubUserNode {
+                            github_id: 1,
+                            login: "alice".to_string(),
+                            url: "https://github.com/alice".to_string(),
+                            ..Default::default()
+                        }),
+                        following: vec![GitHubUserNode {
+                            github_id: 2,
+                            login: "bob".to_string(),
+                            url: "https://github.com/bob".to_string(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("persist graph");
+            discovery
+                .record_person_visit(
+                    "owner",
+                    "bob",
+                    vec!["alice".to_string(), "bob".to_string()],
+                    ExplorationDirection::Following,
+                )
+                .await
+                .expect("persist visit");
+        }
+
+        let reopened_store =
+            Arc::new(LocalGraphStore::from_file(graph_path).expect("reopen store"));
+        let reopened = LocalDiscoveryRepository {
+            store: reopened_store.clone(),
+        };
+        LocalGitHubImportRepository {
+            store: reopened_store,
+        }
+        .import_github_graph(
+            "owner",
+            GraphImport {
+                viewer: Some(GitHubUserNode {
+                    github_id: 2,
+                    login: "robert".to_string(),
+                    url: "https://github.com/robert".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist rename after reopening");
+        let activity = reopened
+            .exploration_activity("owner", MAX_RECENT_PEOPLE)
+            .await
+            .expect("load persisted activity");
+        assert_eq!(activity.max_trail_depth, 1);
+        assert_eq!(activity.recent_people[0].profile.login, "robert");
+        assert_eq!(activity.recent_people[0].trail, ["alice", "robert"]);
+        assert_eq!(
+            activity.recent_people[0].direction,
+            ExplorationDirection::Following
+        );
+    }
+
+    #[test]
+    fn legacy_recent_person_without_stable_trail_ids_remains_readable() {
+        let mut encoded = serde_json::to_value(StoredRecentPerson {
+            github_id: 2,
+            trail_github_ids: vec![1, 2],
+            trail: vec!["alice".to_string(), "bob".to_string()],
+            direction: ExplorationDirection::Followers,
+            last_viewed_at: Utc::now(),
+            visit_count: 1,
+            visible: true,
+        })
+        .expect("encode recent person");
+        encoded
+            .as_object_mut()
+            .expect("recent person encodes as an object")
+            .remove("trail_github_ids");
+        let recent: StoredRecentPerson =
+            serde_json::from_value(encoded).expect("decode legacy recent person");
+        assert!(recent.trail_github_ids.is_empty());
+
+        let profiles = [
+            GitHubUserNode {
+                github_id: 1,
+                login: "alice".to_string(),
+                url: "https://github.com/alice".to_string(),
+                ..Default::default()
+            },
+            GitHubUserNode {
+                github_id: 2,
+                login: "robert".to_string(),
+                url: "https://github.com/robert".to_string(),
+                ..Default::default()
+            },
+        ];
+        let profiles_by_id = profiles
+            .iter()
+            .map(|profile| (profile.github_id, profile))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            canonicalize_stored_trail(&recent, &profiles_by_id, &profiles[1]),
+            ["alice", "robert"]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_exploration_activity_is_bounded_to_fifty_people() {
+        let repositories = LocalRepositorySet::in_memory();
+        let followers = (0..=MAX_RECENT_PEOPLE)
+            .map(|index| GitHubUserNode {
+                github_id: i64::try_from(index + 2).expect("test id"),
+                login: format!("person-{index}"),
+                url: format!("https://github.com/person-{index}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 1,
+                        login: "root".to_string(),
+                        url: "https://github.com/root".to_string(),
+                        ..Default::default()
+                    }),
+                    followers,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed recent people");
+        for index in 0..=MAX_RECENT_PEOPLE {
+            let login = format!("person-{index}");
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    &login,
+                    vec!["root".to_string(), login.clone()],
+                    ExplorationDirection::Followers,
+                )
+                .await
+                .expect("record person");
+        }
+        let activity = repositories
+            .discovery
+            .exploration_activity("owner", MAX_RECENT_PEOPLE)
+            .await
+            .expect("load bounded activity");
+        assert_eq!(activity.recent_people.len(), MAX_RECENT_PEOPLE);
+        assert_eq!(activity.recent_people[0].profile.login, "person-50");
+        assert!(
+            activity
+                .recent_people
+                .iter()
+                .all(|person| person.profile.login != "person-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_recent_person_survives_visible_age_out_and_revisit() {
+        let repositories = LocalRepositorySet::in_memory();
+        let mut followers = vec![GitHubUserNode {
+            github_id: 2,
+            login: "hidden-person".to_string(),
+            url: "https://github.com/hidden-person".to_string(),
+            ..Default::default()
+        }];
+        followers.extend((0..=MAX_RECENT_PEOPLE).map(|index| GitHubUserNode {
+            github_id: i64::try_from(index + 3).expect("test id"),
+            login: format!("visible-person-{index}"),
+            url: format!("https://github.com/visible-person-{index}"),
+            ..Default::default()
+        }));
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 1,
+                        login: "root".to_string(),
+                        url: "https://github.com/root".to_string(),
+                        ..Default::default()
+                    }),
+                    followers,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed recent people");
+
+        repositories
+            .discovery
+            .record_person_visit(
+                "owner",
+                "hidden-person",
+                vec!["root".to_string(), "hidden-person".to_string()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("record hidden person");
+        repositories
+            .discovery
+            .set_recent_person_visible("owner", "hidden-person", false)
+            .await
+            .expect("hide person");
+        for index in 0..=MAX_RECENT_PEOPLE {
+            let login = format!("visible-person-{index}");
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    &login,
+                    vec!["root".to_string(), login.clone()],
+                    ExplorationDirection::Followers,
+                )
+                .await
+                .expect("record visible person");
+        }
+
+        let aged = repositories
+            .discovery
+            .exploration_activity("owner", MAX_RECENT_PEOPLE)
+            .await
+            .expect("load aged activity");
+        assert_eq!(
+            aged.recent_people
+                .iter()
+                .filter(|person| person.visible)
+                .count(),
+            MAX_RECENT_PEOPLE
+        );
+        let hidden = aged
+            .recent_people
+            .iter()
+            .find(|person| person.profile.login == "hidden-person")
+            .expect("hidden tombstone survives visible pruning");
+        assert!(!hidden.visible);
+
+        let revisited = repositories
+            .discovery
+            .record_person_visit(
+                "owner",
+                "hidden-person",
+                vec!["root".to_string(), "hidden-person".to_string()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("revisit hidden person");
+        assert_eq!(revisited.recent_people[0].profile.login, "hidden-person");
+        assert!(!revisited.recent_people[0].visible);
+        assert_eq!(revisited.recent_people[0].visit_count, 2);
+        assert_eq!(
+            revisited
+                .recent_people
+                .iter()
+                .filter(|person| !person.visible)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn hidden_recent_people_are_bounded_to_fifty_tombstones() {
+        let repositories = LocalRepositorySet::in_memory();
+        let hidden_people = (0..=MAX_HIDDEN_RECENT_PEOPLE)
+            .map(|index| GitHubUserNode {
+                github_id: i64::try_from(index + 2).expect("test id"),
+                login: format!("hidden-{index}"),
+                url: format!("https://github.com/hidden-{index}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        repositories
+            .imports
+            .import_github_graph(
+                "owner",
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: 1,
+                        login: "root".to_string(),
+                        url: "https://github.com/root".to_string(),
+                        ..Default::default()
+                    }),
+                    followers: hidden_people,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed hidden people");
+        for index in 0..=MAX_HIDDEN_RECENT_PEOPLE {
+            let login = format!("hidden-{index}");
+            repositories
+                .discovery
+                .record_person_visit(
+                    "owner",
+                    &login,
+                    vec!["root".to_string(), login.clone()],
+                    ExplorationDirection::Followers,
+                )
+                .await
+                .expect("record hidden person");
+            repositories
+                .discovery
+                .set_recent_person_visible("owner", &login, false)
+                .await
+                .expect("hide recent person");
+        }
+
+        let activity = repositories
+            .discovery
+            .exploration_activity("owner", MAX_RECENT_PEOPLE)
+            .await
+            .expect("load bounded tombstones");
+        assert_eq!(activity.recent_people.len(), MAX_HIDDEN_RECENT_PEOPLE);
+        assert!(activity.recent_people.iter().all(|person| !person.visible));
+        assert!(
+            activity
+                .recent_people
+                .iter()
+                .all(|person| person.profile.login != "hidden-0")
+        );
+    }
 
     #[test]
     fn graph_capacity_estimate_deduplicates_incoming_entities_and_relationships() {
@@ -7158,6 +8616,455 @@ mod tests {
         assert_eq!(snapshot.repositories.len(), 2);
         assert_eq!(snapshot.repositories[0].full_name, "acme/at-observation");
         assert_eq!(snapshot.repositories[1].full_name, "acme/at-cutoff");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j database configured through GITEXPLORE_NEO4J_* variables"]
+    async fn live_neo4j_batched_import_and_recent_route_round_trip() {
+        let config = Neo4jConfig {
+            uri: Some(std::env::var("GITEXPLORE_NEO4J_URI").expect("Neo4j URI")),
+            username: Some(std::env::var("GITEXPLORE_NEO4J_USERNAME").expect("Neo4j username")),
+            password: Some(SecretString::from(
+                std::env::var("GITEXPLORE_NEO4J_PASSWORD").expect("Neo4j password"),
+            )),
+            database: std::env::var("GITEXPLORE_NEO4J_DATABASE")
+                .unwrap_or_else(|_| "neo4j".to_string()),
+            max_total_nodes: None,
+            max_total_relationships: None,
+        };
+        let client = Arc::new(Neo4jClient::new(&config).await.expect("Neo4j client"));
+        let imports = Neo4jGitHubImportRepository {
+            client: client.clone(),
+            max_total_nodes: None,
+            max_total_relationships: None,
+        };
+        let discovery = Neo4jDiscoveryRepository {
+            client: client.clone(),
+        };
+        let insight_repository = Neo4jInsightRepository {
+            client: client.clone(),
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..8];
+        let base_id = Utc::now().timestamp_micros();
+        let viewer_login = format!("batch-{suffix}");
+        let follower_login = format!("follower-{suffix}");
+        let following_login = format!("following-{suffix}");
+        let full_name = format!("{viewer_login}/repository");
+        let user_id = format!("batch-import-{suffix}");
+        let coverage = GraphImportCoverage {
+            followers_complete: true,
+            following_complete: true,
+            starred_repositories_complete: true,
+            repositories_complete: true,
+        };
+        imports
+            .import_github_graph(
+                &user_id,
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: base_id,
+                        login: viewer_login.clone(),
+                        url: format!("https://github.com/{viewer_login}"),
+                        ..Default::default()
+                    }),
+                    followers: vec![GitHubUserNode {
+                        github_id: base_id + 1,
+                        login: follower_login.clone(),
+                        url: format!("https://github.com/{follower_login}"),
+                        ..Default::default()
+                    }],
+                    following: vec![GitHubUserNode {
+                        github_id: base_id + 2,
+                        login: following_login.clone(),
+                        url: format!("https://github.com/{following_login}"),
+                        ..Default::default()
+                    }],
+                    repositories: vec![GitHubRepositoryNode {
+                        github_id: base_id + 3,
+                        owner_login: viewer_login.clone(),
+                        name: "repository".to_string(),
+                        full_name: full_name.clone(),
+                        html_url: format!("https://github.com/{full_name}"),
+                        ..Default::default()
+                    }],
+                    starred_repositories: vec![GitHubRepositoryNode {
+                        github_id: base_id + 4,
+                        owner_login: "other".to_string(),
+                        name: "starred".to_string(),
+                        full_name: format!("other/starred-{suffix}"),
+                        html_url: format!("https://github.com/other/starred-{suffix}"),
+                        ..Default::default()
+                    }],
+                    coverage,
+                },
+            )
+            .await
+            .expect("batched graph import");
+
+        let activity = discovery
+            .record_person_visit(
+                &user_id,
+                &follower_login,
+                vec![viewer_login.clone(), follower_login.clone()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("record recent route");
+        assert_eq!(activity.max_trail_depth, 1);
+        assert_eq!(activity.recent_people[0].profile.login, follower_login);
+        assert_eq!(
+            activity.recent_people[0].trail,
+            [viewer_login.as_str(), follower_login.as_str()]
+        );
+
+        assert!(matches!(
+            discovery
+                .record_person_visit(
+                    &user_id,
+                    &viewer_login,
+                    vec![
+                        viewer_login.clone(),
+                        follower_login.clone(),
+                        viewer_login.clone(),
+                    ],
+                    ExplorationDirection::Followers,
+                )
+                .await,
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            discovery
+                .record_person_visit(
+                    &user_id,
+                    &following_login,
+                    vec![follower_login.clone(), following_login.clone()],
+                    ExplorationDirection::Following,
+                )
+                .await,
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            discovery
+                .record_person_visit(
+                    &user_id,
+                    &following_login,
+                    vec![
+                        viewer_login.clone(),
+                        format!("missing-{suffix}"),
+                        following_login.clone(),
+                    ],
+                    ExplorationDirection::Following,
+                )
+                .await,
+            Err(AppError::Validation(_))
+        ));
+
+        let renamed_follower_login = format!("renamed-follower-{suffix}");
+        client
+            .run(
+                query(
+                    "MATCH (follower:User {github_id: $github_id})
+                     SET follower.login = $login,
+                         follower.login_key = $login_key",
+                )
+                .param("github_id", base_id + 1)
+                .param("login", renamed_follower_login.clone())
+                .param("login_key", renamed_follower_login.to_ascii_lowercase()),
+            )
+            .await
+            .expect("rename saved breadcrumb hop");
+        let renamed_activity = discovery
+            .exploration_activity(&user_id, MAX_RECENT_PEOPLE)
+            .await
+            .expect("read renamed recent route");
+        assert_eq!(renamed_activity.recent_people.len(), 1);
+        assert_eq!(renamed_activity.recent_people[0].visit_count, 1);
+        assert_eq!(renamed_activity.max_trail_depth, 1);
+        assert_eq!(
+            renamed_activity.recent_people[0].profile.login,
+            renamed_follower_login
+        );
+        assert_eq!(
+            renamed_activity.recent_people[0].trail,
+            [viewer_login.as_str(), renamed_follower_login.as_str()]
+        );
+        let mut trail_rows = client
+            .graph
+            .execute_on(
+                &client.database,
+                query(
+                    "MATCH (:LocalUser {id: $user_id})-[visit:RECENTLY_VIEWED]->(:User {github_id: $github_id})
+                     RETURN visit.trail_github_ids AS trail_github_ids",
+                )
+                .param("user_id", user_id.clone())
+                .param("github_id", base_id + 1),
+            )
+            .await
+            .expect("read stable trail ids");
+        assert_eq!(
+            trail_rows
+                .next()
+                .await
+                .expect("stable trail row")
+                .expect("stable trail result")
+                .get::<Vec<i64>>("trail_github_ids")
+                .expect("stable trail ids"),
+            [base_id, base_id + 1]
+        );
+
+        insight_repository
+            .save_repository_contributors(RepositoryContributorInsights::from_snapshot(
+                full_name.clone(),
+                RepositoryContributorsSnapshot {
+                    contributors: vec![
+                        RepositoryContributor {
+                            github_id: base_id + 5,
+                            login: format!("contributor-a-{suffix}"),
+                            avatar_url: None,
+                            url: format!("https://github.com/contributor-a-{suffix}"),
+                            contributions: 8,
+                        },
+                        RepositoryContributor {
+                            github_id: base_id + 6,
+                            login: format!("contributor-b-{suffix}"),
+                            avatar_url: None,
+                            url: format!("https://github.com/contributor-b-{suffix}"),
+                            contributions: 5,
+                        },
+                    ],
+                    source_complete: true,
+                },
+                Utc::now(),
+            ))
+            .await
+            .expect("batch contributor import");
+        assert_eq!(
+            insight_repository
+                .repository_contributors(&full_name)
+                .await
+                .expect("read contributor insights")
+                .expect("saved contributor insights")
+                .contributors
+                .len(),
+            2
+        );
+
+        let mut rows = client
+            .graph
+            .execute_on(
+                &client.database,
+                query(
+                    "MATCH (follower:User {github_id: $follower_id})-[:FOLLOWS]->(viewer:User {github_id: $viewer_id})
+                     MATCH (viewer)-[:FOLLOWS]->(following:User {github_id: $following_id})
+                     MATCH (viewer)-[:OWNS]->(:Repository {github_id: $owned_id})
+                     MATCH (viewer)-[:STARRED]->(:Repository {github_id: $starred_id})
+                     RETURN count(*) AS path_count",
+                )
+                .param("viewer_id", base_id)
+                .param("follower_id", base_id + 1)
+                .param("following_id", base_id + 2)
+                .param("owned_id", base_id + 3)
+                .param("starred_id", base_id + 4),
+            )
+            .await
+            .expect("verify batched relationships");
+        assert_eq!(
+            rows.next()
+                .await
+                .expect("relationship row")
+                .expect("relationship result")
+                .get::<i64>("path_count")
+                .expect("path count"),
+            1
+        );
+
+        client
+            .run(
+                query(
+                    "MATCH (local:LocalUser {id: $user_id}) DETACH DELETE local
+                     WITH 1 AS ignored
+                     MATCH (node)
+                     WHERE node.github_id IN $github_ids
+                     DETACH DELETE node",
+                )
+                .param("user_id", user_id)
+                .param(
+                    "github_ids",
+                    vec![
+                        base_id,
+                        base_id + 1,
+                        base_id + 2,
+                        base_id + 3,
+                        base_id + 4,
+                        base_id + 5,
+                        base_id + 6,
+                    ],
+                ),
+            )
+            .await
+            .expect("clean up batch import test");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Neo4j database configured through GITEXPLORE_NEO4J_* variables"]
+    async fn live_neo4j_hidden_recent_person_survives_visible_age_out_and_revisit() {
+        let config = Neo4jConfig {
+            uri: Some(std::env::var("GITEXPLORE_NEO4J_URI").expect("Neo4j URI")),
+            username: Some(std::env::var("GITEXPLORE_NEO4J_USERNAME").expect("Neo4j username")),
+            password: Some(SecretString::from(
+                std::env::var("GITEXPLORE_NEO4J_PASSWORD").expect("Neo4j password"),
+            )),
+            database: std::env::var("GITEXPLORE_NEO4J_DATABASE")
+                .unwrap_or_else(|_| "neo4j".to_string()),
+            max_total_nodes: None,
+            max_total_relationships: None,
+        };
+        let client = Arc::new(Neo4jClient::new(&config).await.expect("Neo4j client"));
+        let imports = Neo4jGitHubImportRepository {
+            client: client.clone(),
+            max_total_nodes: None,
+            max_total_relationships: None,
+        };
+        let discovery = Neo4jDiscoveryRepository {
+            client: client.clone(),
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..8];
+        let base_id = Utc::now().timestamp_micros();
+        let root_login = format!("retention-root-{suffix}");
+        let hidden_login = format!("retention-hidden-{suffix}");
+        let user_id = format!("retention-{suffix}");
+        let mut followers = vec![GitHubUserNode {
+            github_id: base_id + 1,
+            login: hidden_login.clone(),
+            url: format!("https://github.com/{hidden_login}"),
+            ..Default::default()
+        }];
+        followers.extend((0..=MAX_RECENT_PEOPLE).map(|index| {
+            let login = format!("retention-visible-{suffix}-{index}");
+            GitHubUserNode {
+                github_id: base_id + 2 + i64::try_from(index).expect("test id"),
+                url: format!("https://github.com/{login}"),
+                login,
+                ..Default::default()
+            }
+        }));
+        imports
+            .import_github_graph(
+                &user_id,
+                GraphImport {
+                    viewer: Some(GitHubUserNode {
+                        github_id: base_id,
+                        login: root_login.clone(),
+                        url: format!("https://github.com/{root_login}"),
+                        ..Default::default()
+                    }),
+                    followers,
+                    coverage: GraphImportCoverage {
+                        followers_complete: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed live retention graph");
+
+        discovery
+            .record_person_visit(
+                &user_id,
+                &hidden_login,
+                vec![root_login.clone(), hidden_login.clone()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("record live hidden person");
+        discovery
+            .set_recent_person_visible(&user_id, &hidden_login, false)
+            .await
+            .expect("hide live recent person");
+        for index in 0..=MAX_RECENT_PEOPLE {
+            let login = format!("retention-visible-{suffix}-{index}");
+            discovery
+                .record_person_visit(
+                    &user_id,
+                    &login,
+                    vec![root_login.clone(), login.clone()],
+                    ExplorationDirection::Followers,
+                )
+                .await
+                .expect("record live visible person");
+        }
+
+        let aged = discovery
+            .exploration_activity(&user_id, MAX_RECENT_PEOPLE)
+            .await
+            .expect("read aged live activity");
+        assert_eq!(
+            aged.recent_people
+                .iter()
+                .filter(|person| person.visible)
+                .count(),
+            MAX_RECENT_PEOPLE
+        );
+        assert!(
+            aged.recent_people
+                .iter()
+                .any(|person| { person.profile.login == hidden_login && !person.visible })
+        );
+
+        let revisited = discovery
+            .record_person_visit(
+                &user_id,
+                &hidden_login,
+                vec![root_login, hidden_login.clone()],
+                ExplorationDirection::Followers,
+            )
+            .await
+            .expect("revisit live hidden person");
+        assert_eq!(revisited.recent_people[0].profile.login, hidden_login);
+        assert!(!revisited.recent_people[0].visible);
+        assert_eq!(revisited.recent_people[0].visit_count, 2);
+
+        let mut rows = client
+            .graph
+            .execute_on(
+                &client.database,
+                query(
+                    "MATCH (:LocalUser {id: $user_id})-[visit:RECENTLY_VIEWED]->(:User)
+                     RETURN sum(CASE WHEN coalesce(visit.visible, true) THEN 1 ELSE 0 END) AS visible_count,
+                            sum(CASE WHEN coalesce(visit.visible, true) THEN 0 ELSE 1 END) AS hidden_count",
+                )
+                .param("user_id", user_id.clone()),
+            )
+            .await
+            .expect("read live retained relationship counts");
+        let row = rows
+            .next()
+            .await
+            .expect("retention count row")
+            .expect("retention count result");
+        assert_eq!(row.get::<i64>("visible_count").expect("visible count"), 50);
+        assert_eq!(row.get::<i64>("hidden_count").expect("hidden count"), 1);
+
+        let github_ids = (0..=(MAX_RECENT_PEOPLE + 2))
+            .map(|offset| base_id + i64::try_from(offset).expect("cleanup id"))
+            .collect::<Vec<_>>();
+        client
+            .run(
+                query(
+                    "MATCH (local:LocalUser {id: $user_id}) DETACH DELETE local
+                     WITH 1 AS ignored
+                     MATCH (node:User)
+                     WHERE node.github_id IN $github_ids
+                     DETACH DELETE node",
+                )
+                .param("user_id", user_id)
+                .param("github_ids", github_ids),
+            )
+            .await
+            .expect("clean up live retention test");
     }
 
     #[tokio::test]
