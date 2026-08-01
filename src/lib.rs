@@ -11,6 +11,7 @@ pub mod graphql;
 pub mod http;
 pub mod identity;
 pub mod insights;
+pub mod onboarding;
 pub mod ports;
 pub mod schema;
 pub mod shared;
@@ -329,6 +330,148 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn onboarding_tracks_real_private_actions_and_replay_uses_a_fresh_window() {
+        let repositories = LocalRepositorySet::in_memory();
+        repositories
+            .imports
+            .import_github_graph(
+                "onboarding-user",
+                GraphImport {
+                    viewer: Some(test_user(1, "alice")),
+                    following: vec![test_user(2, "bob")],
+                    starred_repositories: vec![test_repository(
+                        10,
+                        "acme/trail-map",
+                        "Rust",
+                        80,
+                        6,
+                    )],
+                    coverage: GraphImportCoverage::default(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed onboarding graph");
+        let services = AppServices::new(
+            AppServiceRepositories {
+                identity: repositories.identity,
+                imports: repositories.imports,
+                sync_state: repositories.sync_state,
+                categories: repositories.categories,
+                bookmarks: repositories.bookmarks,
+                exploration: repositories.exploration,
+                discovery: repositories.discovery,
+                insights: repositories.insights,
+            },
+            Arc::new(StubGitHubClient::default()),
+            GitHubAuthConfig {
+                client_id: secrecy::SecretString::from("stub-client"),
+                client_secret: None,
+                redirect_uri: None,
+                scopes: vec!["read:user".to_string()],
+            },
+        );
+
+        let initial = services
+            .onboarding
+            .progress("onboarding-user")
+            .await
+            .expect("initial onboarding");
+        assert_eq!(
+            initial.status,
+            crate::onboarding::OnboardingStatus::NotStarted
+        );
+        let started = services
+            .onboarding
+            .begin("onboarding-user")
+            .await
+            .expect("begin onboarding");
+        assert_eq!(
+            started.status,
+            crate::onboarding::OnboardingStatus::InProgress
+        );
+        assert!(
+            services
+                .onboarding
+                .complete("onboarding-user")
+                .await
+                .is_err()
+        );
+
+        services
+            .discovery
+            .record_person_visit(
+                "onboarding-user",
+                "alice",
+                vec!["alice".to_string()],
+                crate::discovery::ExplorationDirection::Following,
+            )
+            .await
+            .expect("record trailhead");
+        services
+            .discovery
+            .record_person_visit(
+                "onboarding-user",
+                "bob",
+                vec!["alice".to_string(), "bob".to_string()],
+                crate::discovery::ExplorationDirection::Following,
+            )
+            .await
+            .expect("record connection");
+        services
+            .bookmarks
+            .add_bookmark(
+                "onboarding-user",
+                BookmarkTarget::GitHubRepository {
+                    full_name: "acme/trail-map".to_string(),
+                },
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect("save onboarding repository");
+
+        let completed = services
+            .onboarding
+            .complete("onboarding-user")
+            .await
+            .expect("complete onboarding");
+        assert_eq!(
+            completed.status,
+            crate::onboarding::OnboardingStatus::Completed
+        );
+        assert!(completed.required_steps_complete());
+        assert_eq!(
+            services
+                .onboarding
+                .progress("another-user")
+                .await
+                .expect("isolated onboarding")
+                .status,
+            crate::onboarding::OnboardingStatus::NotStarted
+        );
+
+        let replayed = services
+            .onboarding
+            .restart("onboarding-user")
+            .await
+            .expect("restart onboarding");
+        assert!(!replayed.opened_trailhead);
+        assert!(!replayed.followed_connection);
+        assert!(!replayed.saved_repository);
+        let dismissed = services
+            .onboarding
+            .dismiss("onboarding-user")
+            .await
+            .expect("dismiss replay");
+        assert_eq!(
+            dismissed.status,
+            crate::onboarding::OnboardingStatus::Dismissed
+        );
+        assert!(dismissed.dismissed_at.is_some());
     }
 
     #[tokio::test]

@@ -231,6 +231,50 @@ describe('createGitExploreApi', () => {
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: 'include' });
   });
 
+  it('reads and transitions cookie-authenticated onboarding without a user id', async () => {
+    const fetchMock = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      expect(body.variables).toEqual({});
+      expect(body.query).not.toContain('userId');
+      const progress = {
+        version: 1,
+        status: body.query.includes('DismissOnboarding') ? 'DISMISSED' : 'IN_PROGRESS',
+        startedAt: '2026-08-01T10:00:00Z',
+        completedAt: null,
+        dismissedAt: body.query.includes('DismissOnboarding') ? '2026-08-01T10:05:00Z' : null,
+        openedTrailhead: false,
+        followedConnection: false,
+        savedRepository: false,
+        mappingStarted: false
+      };
+      const key = body.query.includes('BeginOnboarding')
+        ? 'beginOnboarding'
+        : body.query.includes('DismissOnboarding')
+          ? 'dismissOnboarding'
+          : body.query.includes('RestartOnboarding')
+            ? 'restartOnboarding'
+            : body.query.includes('CompleteOnboarding')
+              ? 'completeOnboarding'
+              : 'onboardingProgress';
+      return Response.json({ data: { [key]: progress } });
+    });
+    const api = createGitExploreApi({
+      baseUrl: 'http://localhost:4000',
+      fetch: fetchMock as typeof fetch
+    });
+
+    await expect(api.getOnboardingProgress()).resolves.toMatchObject({ version: 1 });
+    await expect(api.beginOnboarding()).resolves.toMatchObject({ status: 'IN_PROGRESS' });
+    await expect(api.dismissOnboarding()).resolves.toMatchObject({ status: 'DISMISSED' });
+    await expect(api.restartOnboarding()).resolves.toMatchObject({ status: 'IN_PROGRESS' });
+    await expect(api.completeOnboarding()).resolves.toMatchObject({ version: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: 'include' });
+  });
+
   it('persists recent people with their hop trail and normalizes direction', async () => {
     const fetchMock = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as {

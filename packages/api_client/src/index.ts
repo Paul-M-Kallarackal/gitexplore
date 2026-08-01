@@ -189,6 +189,24 @@ export type DiscoveryWarmup = {
   lastError: string | null;
 };
 
+export type OnboardingStatus =
+  | 'NOT_STARTED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'DISMISSED';
+
+export type OnboardingProgress = {
+  version: number;
+  status: OnboardingStatus;
+  startedAt: string | null;
+  completedAt: string | null;
+  dismissedAt: string | null;
+  openedTrailhead: boolean;
+  followedConnection: boolean;
+  savedRepository: boolean;
+  mappingStarted: boolean;
+};
+
 export type RepositoryContributor = {
   githubId: string;
   login: string;
@@ -319,6 +337,10 @@ export class GitExploreApiError extends Error {
 export function createGitExploreApi(options: ApiClientOptions) {
   const baseUrl = options.baseUrl.replace(/\/$/, '');
   const fetchImpl = options.fetch ?? fetch;
+  const onboardingFields = `
+    version status startedAt completedAt dismissedAt
+    openedTrailhead followedConnection savedRepository mappingStarted
+  `;
 
   async function request<T>(
     path: string,
@@ -477,6 +499,51 @@ export function createGitExploreApi(options: ApiClientOptions) {
         {}
       );
       return data.startDiscoveryWarmup;
+    },
+    getOnboardingProgress: async () => {
+      const data = await graphql<{ onboardingProgress: OnboardingProgress }>(
+        `query OnboardingProgress {
+          onboardingProgress { ${onboardingFields} }
+        }`,
+        {}
+      );
+      return data.onboardingProgress;
+    },
+    beginOnboarding: async () => {
+      const data = await graphql<{ beginOnboarding: OnboardingProgress }>(
+        `mutation BeginOnboarding {
+          beginOnboarding { ${onboardingFields} }
+        }`,
+        {}
+      );
+      return data.beginOnboarding;
+    },
+    dismissOnboarding: async () => {
+      const data = await graphql<{ dismissOnboarding: OnboardingProgress }>(
+        `mutation DismissOnboarding {
+          dismissOnboarding { ${onboardingFields} }
+        }`,
+        {}
+      );
+      return data.dismissOnboarding;
+    },
+    restartOnboarding: async () => {
+      const data = await graphql<{ restartOnboarding: OnboardingProgress }>(
+        `mutation RestartOnboarding {
+          restartOnboarding { ${onboardingFields} }
+        }`,
+        {}
+      );
+      return data.restartOnboarding;
+    },
+    completeOnboarding: async () => {
+      const data = await graphql<{ completeOnboarding: OnboardingProgress }>(
+        `mutation CompleteOnboarding {
+          completeOnboarding { ${onboardingFields} }
+        }`,
+        {}
+      );
+      return data.completeOnboarding;
     },
     getRepositoryInsights: async (fullName: string, limit = 12) => {
       const data = await graphql<{

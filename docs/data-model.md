@@ -105,7 +105,7 @@ The shared graph does not use `LocalUser-[:OWNS_GRAPH]->User`. Public facts are 
 
 ```mermaid
 flowchart LR
-    local["LocalUser {id, exploration_max_depth}"]
+    local["LocalUser {id, exploration_max_depth,\nonboarding version/status/timestamps}"]
     category["Category {user_id, name}"]
     bookmark["Bookmark {id, user_id, target_kind,\ntarget_github_id, note, created_at}"]
     snapshot["ExplorationSnapshot {id, user_id, ...}"]
@@ -129,6 +129,8 @@ flowchart LR
 ```
 
 Recent-person history is a private relationship from `LocalUser` to the canonical shared `User`, so GitHub login renames keep the saved destination attached to its stable numeric identity. The relationship stores the latest bounded trail (at most eight stable GitHub user ids with canonical login fallbacks), connection direction, server timestamp, visit count, and explicit visibility. Before a route can increase progress, every hop must resolve in the shared graph and every adjacent pair must have a `FOLLOWS` relationship in either direction. Recording a visit preserves `visible = false` after the user removes that person; the profile's Add action is the only operation that makes it visible again. Writes retain the 50 most recently viewed visible relationships plus 50 hidden opt-out tombstones, so an older explicit removal cannot silently reappear after pruning. `LocalUser.exploration_max_depth` only increases and is independent of removal, so earned Trailhead/Scout/Pathfinder/Cartographer progress survives restarts and shallower routes. The file adapter stores the equivalent per-user records and maximum in `graph.json`.
+
+`LocalUser` also owns the versioned onboarding lifecycle. Neo4j stores `onboarding_version`, `onboarding_status`, `onboarding_started_at`, `onboarding_completed_at`, and `onboarding_dismissed_at`; file mode stores the equivalent record in a serde-defaulted per-user map. Step completion is derived from private visits and repository bookmarks within the active start window, not persisted as client-controlled booleans. Missing or older-version state means the current guide has not started.
 
 `SyncState` is keyed directly by `user_id`; the current adapter does not add a relationship from `LocalUser`. It also owns that app user's serialized discovery-warmup job and a separately queryable status. The private job contains its id, connected-account seed, deduplicated expanded/frontier logins, current login, reserve observation, timestamps, and bounded error. Expanded and pending logins share a 10,000-user total bound, chosen to keep one private job well below the 190,000-node production import boundary. Once that bound is reached, additional candidates set `frontierTruncated` and are not retained, so exhausting the retained frontier still terminates the job. Neo4j updates this state only while the caller owns the fenced `discovery-warmup:<user_id>` `RefreshLease`; public users, repositories, and relationships discovered by the job still enter the shared graph.
 

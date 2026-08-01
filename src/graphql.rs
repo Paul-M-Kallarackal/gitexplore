@@ -21,6 +21,7 @@ use crate::{
         USER_COMMIT_ACTIVITY_SOURCE, USER_COMMIT_ACTIVITY_WINDOW_DAYS, UserCommitRepository,
         UserCommitRepositoryInsights,
     },
+    onboarding::{OnboardingProgress, OnboardingStatus},
     shared::{AppError, Shared},
 };
 
@@ -101,6 +102,22 @@ impl QueryRoot {
             .map_err(graphql_error)
     }
 
+    #[graphql(complexity = 6)]
+    async fn onboarding_progress(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<OnboardingProgressObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .onboarding
+            .progress(user_id)
+            .await
+            .map(OnboardingProgressObject::from)
+            .map_err(graphql_error)
+    }
+
     #[graphql(complexity = 12)]
     async fn repository_insights(
         &self,
@@ -175,6 +192,70 @@ impl MutationRoot {
             .start_warmup(user_id)
             .await
             .map(DiscoveryWarmupObject::from)
+            .map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 6)]
+    async fn begin_onboarding(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<OnboardingProgressObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .onboarding
+            .begin(user_id)
+            .await
+            .map(OnboardingProgressObject::from)
+            .map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 6)]
+    async fn dismiss_onboarding(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<OnboardingProgressObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .onboarding
+            .dismiss(user_id)
+            .await
+            .map(OnboardingProgressObject::from)
+            .map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 6)]
+    async fn restart_onboarding(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<OnboardingProgressObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .onboarding
+            .restart(user_id)
+            .await
+            .map(OnboardingProgressObject::from)
+            .map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 6)]
+    async fn complete_onboarding(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<OnboardingProgressObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .onboarding
+            .complete(user_id)
+            .await
+            .map(OnboardingProgressObject::from)
             .map_err(graphql_error)
     }
 
@@ -398,6 +479,54 @@ impl From<DiscoveryWarmupJob> for DiscoveryWarmupObject {
             updated_at: value.updated_at.to_rfc3339(),
             completed_at: value.completed_at.map(|timestamp| timestamp.to_rfc3339()),
             last_error: value.last_error,
+        }
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+pub enum OnboardingStatusObject {
+    NotStarted,
+    InProgress,
+    Completed,
+    Dismissed,
+}
+
+impl From<OnboardingStatus> for OnboardingStatusObject {
+    fn from(value: OnboardingStatus) -> Self {
+        match value {
+            OnboardingStatus::NotStarted => Self::NotStarted,
+            OnboardingStatus::InProgress => Self::InProgress,
+            OnboardingStatus::Completed => Self::Completed,
+            OnboardingStatus::Dismissed => Self::Dismissed,
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct OnboardingProgressObject {
+    pub version: i32,
+    pub status: OnboardingStatusObject,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub dismissed_at: Option<String>,
+    pub opened_trailhead: bool,
+    pub followed_connection: bool,
+    pub saved_repository: bool,
+    pub mapping_started: bool,
+}
+
+impl From<OnboardingProgress> for OnboardingProgressObject {
+    fn from(value: OnboardingProgress) -> Self {
+        Self {
+            version: value.version,
+            status: value.status.into(),
+            started_at: value.started_at.map(|timestamp| timestamp.to_rfc3339()),
+            completed_at: value.completed_at.map(|timestamp| timestamp.to_rfc3339()),
+            dismissed_at: value.dismissed_at.map(|timestamp| timestamp.to_rfc3339()),
+            opened_trailhead: value.opened_trailhead,
+            followed_connection: value.followed_connection,
+            saved_repository: value.saved_repository,
+            mapping_started: value.mapping_started,
         }
     }
 }
@@ -932,6 +1061,12 @@ mod tests {
         assert!(sdl.contains("explorationActivity(limit: Int!): ExplorationActivityObject!"));
         assert!(sdl.contains("recordPersonVisit("));
         assert!(sdl.contains("setRecentPersonVisible("));
+        assert!(sdl.contains("onboardingProgress: OnboardingProgressObject!"));
+        assert!(sdl.contains("beginOnboarding: OnboardingProgressObject!"));
+        assert!(sdl.contains("dismissOnboarding: OnboardingProgressObject!"));
+        assert!(sdl.contains("restartOnboarding: OnboardingProgressObject!"));
+        assert!(sdl.contains("completeOnboarding: OnboardingProgressObject!"));
+        assert!(!sdl.contains("onboardingProgress(userId:"));
     }
 
     #[test]

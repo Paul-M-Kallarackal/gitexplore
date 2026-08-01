@@ -91,6 +91,20 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Restore Playwright Chromium cache
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-${{ runner.arch }}-playwright-1.61.1-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install Chromium operating-system dependencies
+        run: pnpm exec playwright install-deps chromium
+
+      - name: Install pinned Chromium browser
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install chromium
+
       - name: Verify Rust service
         run: |
           cargo fmt --check
@@ -101,6 +115,7 @@ jobs:
         run: |
           pnpm --filter @gitexplore/api-client test
           pnpm --filter @gitexplore/web test
+          pnpm --filter @gitexplore/web test:e2e
           pnpm check
 
       - name: Verify production contract and web build

@@ -7,12 +7,14 @@ import { ArrowRightIcon, CircleAlertIcon, GitHubIcon, UsersIcon } from 'strawn-i
 import { api } from '../api';
 import { useAuth } from '../auth';
 import { buildExploreHref, isLikelyGitHubLogin, normalizeLoginInput } from '../lib/graph-navigation';
+import { useOnboarding } from '../onboarding';
 import { useDocumentTitle } from '../useDocumentTitle';
 
 export function ExploreStartPage() {
   useDocumentTitle('Explore');
   const navigate = useNavigate();
   const { status } = useAuth();
+  const { active: onboardingActive, currentStep: onboardingStep } = useOnboarding();
   const accountLogin = status?.account?.login ?? '';
   const [search, setSearch] = useState(accountLogin);
   const [validationError, setValidationError] = useState('');
@@ -59,6 +61,13 @@ export function ExploreStartPage() {
           <Heading id="search-title" size="h2">Open a public profile</Heading>
           <Text size="sm" color="$mutedForeground">Handles and full github.com profile URLs both work.</Text>
         </div>
+        {onboardingActive && onboardingStep === 'trailhead' ? (
+          <div className="onboarding-context onboarding-start-context" role="status">
+            <Text size="xs" color="$mutedForeground">Step 1 of 3</Text>
+            <Heading size="h3">Choose your trailhead</Heading>
+            <Text size="sm" color="$mutedForeground">Your connected account is ready below, or enter any public GitHub profile to begin.</Text>
+          </div>
+        ) : null}
         <form className="profile-search" onSubmit={submit} noValidate>
           <SearchField
             label="GitHub username"

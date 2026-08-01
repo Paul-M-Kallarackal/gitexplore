@@ -206,6 +206,12 @@ mutation HideRecentPerson {
 }
 ```
 
+### First-value onboarding
+
+`onboardingProgress` returns the current session owner's versioned lifecycle and derives its three required steps from private activity after `startedAt`. The lifecycle mutations accept no identity argument: `beginOnboarding`, `dismissOnboarding`, `restartOnboarding`, and `completeOnboarding`. Completion validates a recorded trailhead visit, a route with at least one connection, and a repository bookmark in the active window. See [First-value onboarding](first-value-onboarding.md) for the browser behavior and full operation shape.
+
+Discovery warmup is reported as optional `mappingStarted` context. Reading or beginning onboarding never starts mapping or spends GitHub requests.
+
 ### Warm the discovery graph
 
 `startDiscoveryWarmup` starts one private job for the authenticated app user; it accepts no identity or seed argument. The connected GitHub login is the seed. Repeated starts return the same active job, so browser retries cannot create duplicate work. `COMPLETED` remains idempotently complete. A `RESERVE_PROTECTED` job is also returned unchanged before its recorded reset; an explicit start after that reset atomically requeues the same job id with its existing frontier and progress. A start after `FAILED` creates a new attempt.

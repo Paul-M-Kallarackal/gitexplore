@@ -81,6 +81,8 @@ After browser OAuth, use `http://localhost:3000/app/explore` for the GraphQL exp
 
 The session cookie and its durable Neo4j record expire after 30 days. Neo4j stores a keyed digest rather than the cookie value. Expired records are purged during session creation/resolution, and the store is bounded to 4,096 active sessions. `POST /auth/logout` removes the current server mapping and returns an expired session cookie. Browser sign-out does not disconnect the GitHub credential. A credential disconnect removes encrypted credential properties but retains the stable account link so reconnecting the same GitHub account recovers its private overlay.
 
+The authenticated shell also reads private `onboardingProgress`. Accounts without the current version see the embedded three-step first-value guide; lifecycle reads and writes are cookie-derived and accept no user id. The guide never starts discovery warmup automatically. Its optional mapping control invokes `startDiscoveryWarmup` only after explicit input and preserves the existing 1,000-request reserve.
+
 ### One-time identity migration
 
 For a stack with an existing `/var/lib/gitexplore/identity.json`, stop the old `gitexplore` writer, start Neo4j and apply the current schema, then run the guarded migration with the same data volume and the production identity key:

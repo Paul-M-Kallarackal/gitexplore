@@ -6,6 +6,8 @@
 node_modules/
 .turbo/
 apps/web/dist/
+apps/web/test-results/
+apps/web/playwright-report/
 apps/web/.vercel/
 .vercel/
 .gitexplore-*.png

@@ -1,11 +1,12 @@
 import type { DiscoveryWarmup, DiscoveryWarmupStatus } from '@gitexplore/api-client';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Alert, Avatar, Badge, Button, Heading, Progress, Skeleton, Text } from 'strawn';
-import { CircleAlertIcon, ClockIcon, DatabaseIcon, LogOutIcon, RefreshIcon } from 'strawn-icons';
+import { CircleAlertIcon, ClockIcon, DatabaseIcon, LogOutIcon, MapPinIcon, RefreshIcon } from 'strawn-icons';
 
 import { api } from '../api';
 import { useAuth, useLogout } from '../auth';
 import { formatTimestamp } from '../lib/format';
+import { useOnboarding } from '../onboarding';
 import { useDocumentTitle } from '../useDocumentTitle';
 
 const activeWarmupStatuses: DiscoveryWarmupStatus[] = ['QUEUED', 'RUNNING'];
@@ -67,6 +68,7 @@ export function SettingsPage() {
   const { status } = useAuth();
   const logout = useLogout();
   const queryClient = useQueryClient();
+  const { progress: onboarding, restart, restartPending, error: onboardingError } = useOnboarding();
 
   const warmupQuery = useQuery({
     queryKey: ['discovery-warmup'],
@@ -229,6 +231,27 @@ export function SettingsPage() {
             </Alert>
           ) : null}
         </div>
+      </section>
+
+      <section className="settings-section" aria-labelledby="onboarding-settings-title">
+        <div className="settings-heading">
+          <span className="settings-index">04</span>
+          <div>
+            <Heading id="onboarding-settings-title" size="h2">First-value guide</Heading>
+            <Text size="sm" color="$mutedForeground">Replay the three-step trail through a person, a connection, and a private repository save.</Text>
+          </div>
+        </div>
+        <div className="onboarding-settings-row">
+          <span><MapPinIcon aria-hidden="true" size={20} /><span><strong>{onboarding?.status === 'COMPLETED' ? 'Onboarding complete' : onboarding?.status === 'DISMISSED' ? 'Onboarding skipped' : 'Onboarding available'}</strong><small>Restarting creates a fresh activation window without changing saved data.</small></span></span>
+          <Button
+            variant="outline"
+            loading={restartPending}
+            onClick={() => void restart().then(() => window.location.assign('/app/explore'))}
+          >
+            Replay onboarding
+          </Button>
+        </div>
+        {onboardingError ? <Alert tone="warning" title="Onboarding could not be updated">{onboardingError.message}</Alert> : null}
       </section>
 
     </div>

@@ -52,7 +52,7 @@ flowchart LR
     rest --> web
 ```
 
-Public GitHub identities, public repositories, and relationship facts are shared cache data. The authenticated app user owns connection credentials, the opaque browser session, bookmark state, categories, snapshots, sync state, recent-person routes, expedition progress, and discovery-warmup progress. Repository discovery joins the shared facts to only the current user's save overlay. Browser connections are canonicalized by stable GitHub user id, so reconnecting the same GitHub account preserves that private overlay. The stable account link remains when credentials are disconnected.
+Public GitHub identities, public repositories, and relationship facts are shared cache data. The authenticated app user owns connection credentials, the opaque browser session, bookmark state, categories, snapshots, sync state, recent-person routes, expedition progress, versioned onboarding lifecycle state, and discovery-warmup progress. Repository discovery joins the shared facts to only the current user's save overlay. Browser connections are canonicalized by stable GitHub user id, so reconnecting the same GitHub account preserves that private overlay. The stable account link remains when credentials are disconnected.
 
 Shared graph identity is also stable-id first. Lowercase `login_key` and `full_name_key` properties provide case-insensitive alias lookup, while GitHub's numeric user/repository ids remain canonical. A rename moves the existing stable node to its new alias; reuse of an old alias by a different numeric id does not merge the two histories.
 

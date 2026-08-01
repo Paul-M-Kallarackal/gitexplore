@@ -5,6 +5,8 @@ import { BookmarkIcon, GitHubIcon, SearchIcon, SettingsIcon } from 'strawn-icons
 
 import { api } from '../api';
 import { useAuth } from '../auth';
+import { OnboardingProvider } from '../onboarding';
+import { OnboardingChecklist, OnboardingCompletion } from './OnboardingChecklist';
 
 const navItems = [
   { to: '/app/explore', label: 'Explore', icon: SearchIcon },
@@ -13,6 +15,10 @@ const navItems = [
 ] as const;
 
 export function AppShell() {
+  return <OnboardingProvider><AppShellContent /></OnboardingProvider>;
+}
+
+function AppShellContent() {
   const { status } = useAuth();
   const rateQuery = useQuery({
     queryKey: ['github-rate-limit'],
@@ -65,7 +71,11 @@ export function AppShell() {
         </Link>
         {rateQuery.data ? <span className="numeric-caption">{rateQuery.data.remaining.toLocaleString()} requests</span> : null}
       </header>
-      <main id="main-content" className="app-main" tabIndex={-1}><Outlet /></main>
+      <main id="main-content" className="app-main" tabIndex={-1}>
+        <OnboardingCompletion />
+        <OnboardingChecklist />
+        <Outlet />
+      </main>
       <nav className="mobile-nav" aria-label="Primary">
         {navItems.map(({ to, label, icon: Icon }) => (
           <NavLink key={to} to={to} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
