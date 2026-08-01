@@ -62,6 +62,12 @@ requireContract(
 
 requireContract(vercel.services?.web?.framework === 'vite', 'Vercel web service must use Vite');
 requireContract(
+  vercel.services?.web?.rewrites?.some(
+    (rewrite) => rewrite.source === '/(.*)' && rewrite.destination === '/index.html'
+  ),
+  'Vercel web service must own the SPA fallback to index.html'
+);
+requireContract(
   vercel.git?.deploymentEnabled === false,
   'Automatic Vercel Git deployments must stay disabled; the protected release workflow owns production'
 );
@@ -83,23 +89,20 @@ for (const route of ['/auth/(.*)', '/graphql', '/health']) {
     `Vercel API rewrite missing for ${route}`
   );
 }
-for (const route of ['/login', '/app/(.*)']) {
-  requireContract(
-    vercel.rewrites?.some(
-      (rewrite) =>
-        rewrite.source === route &&
-        rewrite.destination?.service === 'web' &&
-        rewrite.destination.path === undefined &&
-        rewrite.transforms?.some(
-          (transform) =>
-            transform.type === 'request.path' &&
-            transform.op === 'set' &&
-            transform.args === '/index.html'
-        )
-    ),
-    `Vercel SPA request-path transform missing for ${route}`
-  );
-}
+requireContract(
+  vercel.rewrites?.some(
+    (rewrite) => rewrite.source === '/(.*)' && rewrite.destination?.service === 'web'
+  ),
+  'Vercel web service catch-all is missing'
+);
+requireContract(
+  !vercel.rewrites?.some(
+    (rewrite) =>
+      rewrite.destination?.service === 'web' &&
+      (rewrite.destination.path !== undefined || rewrite.transforms !== undefined)
+  ),
+  'Top-level web handoffs must preserve the request for service-local SPA routing'
+);
 for (const header of [
   'Content-Security-Policy',
   'Strict-Transport-Security',

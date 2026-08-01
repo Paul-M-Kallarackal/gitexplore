@@ -97,7 +97,7 @@ The authenticated shell has three primary areas: Explore, Saved, and Settings. S
 
 - `apps/web/src/`: React routes, authentication boundary, query state, and product composition
 - `apps/web/vite.config.ts`: development API proxy and browser-test configuration
-- `vercel.json`: production Services routing, including direct `/login` and `/app/*` request-path transforms to the SPA entry point
+- `vercel.json`: production Services routing, including the web service's filesystem-first SPA fallback for direct `/login` and `/app/*` entry points
 - `apps/web/vercel.json`: standalone Vite SPA fallback
 - `packages/api_client/src/index.ts`: credentialed REST/GraphQL client and OAuth URL helper
 - `src/http.rs`: OAuth routes, cookie creation/resolution, CORS, GraphQL routing
