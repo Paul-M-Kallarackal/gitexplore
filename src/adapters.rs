@@ -4801,7 +4801,7 @@ impl BookmarkRepository for Neo4jBookmarkRepository {
                             collect(DISTINCT category.name) AS categories,
                             user.login AS user_login,
                             repo.full_name AS repo_full_name
-                     ORDER BY bookmark.created_at DESC",
+                     ORDER BY created_at DESC",
                 )
                 .param("user_id", user_id.to_string()),
             )
