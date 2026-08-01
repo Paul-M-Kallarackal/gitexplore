@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { chromium } from '@playwright/test';
 
-const rawBaseUrl = process.argv[2] ?? process.env.GITEXPLORE_SMOKE_BASE_URL;
+const rawBaseUrl = process.argv.slice(2).find((argument) => argument !== '--')
+  ?? process.env.GITEXPLORE_SMOKE_BASE_URL;
 assert(rawBaseUrl, 'Usage: pnpm production:smoke -- <base-url>');
 
 const baseUrl = new URL(rawBaseUrl);
