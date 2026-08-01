@@ -61,6 +61,14 @@
       "destination": { "service": "api" }
     },
     {
+      "source": "/login",
+      "destination": { "service": "web", "path": "/index.html" }
+    },
+    {
+      "source": "/app/(.*)",
+      "destination": { "service": "web", "path": "/index.html" }
+    },
+    {
       "source": "/(.*)",
       "destination": { "service": "web" }
     }
