@@ -12,7 +12,7 @@ This document describes the deployment scaffold. It does not claim that the prod
 - `api` builds `Dockerfile.vercel` as a Rust container and receives `/auth/*`, `/graphql`, `/health`, `/sync/*`, `/bookmarks`, `/categories`, and `/explore*`.
 - The web service receives `GITEXPLORE_INTERNAL_API_BASE_URL` through a private Vercel service binding.
 
-The linked Vercel project's Framework Preset must be set to **Services**. Vercel only activates this topology when that project setting and the top-level `services` configuration are both present.
+The linked Vercel project's Framework Preset must be set to **Services**. Vercel only activates this topology when that project setting and the top-level `services` configuration are both present. Automatic Vercel Git deployments are disabled in `vercel.json`; the protected, main-only release workflow owns production builds and domain updates.
 
 The public browser API base must use the same deployed origin. For production it is `https://gitexplore.moriatz.com`. The GitHub OAuth callback must be registered exactly as:
 

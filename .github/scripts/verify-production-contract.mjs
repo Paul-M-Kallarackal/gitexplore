@@ -62,6 +62,10 @@ requireContract(
 
 requireContract(vercel.services?.web?.framework === 'sveltekit', 'Vercel web service must use SvelteKit');
 requireContract(
+  vercel.git?.deploymentEnabled === false,
+  'Automatic Vercel Git deployments must stay disabled; the protected release workflow owns production'
+);
+requireContract(
   vercel.services?.api?.entrypoint === 'Dockerfile.vercel' &&
     vercel.services.api.runtime === 'container',
   'Vercel API service must use Dockerfile.vercel'
