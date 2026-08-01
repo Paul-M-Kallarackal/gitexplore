@@ -206,14 +206,21 @@ a {
 }
 
 .app-main {
-  display: grid;
-  align-content: start;
-  gap: var(--space-6);
   width: min(100%, var(--size-container-wide));
   padding: var(--space-8) clamp(var(--space-5), 4vw, var(--space-12)) var(--space-16);
 }
 
 /* First-value onboarding */
+.onboarding-slot {
+  display: grid;
+  gap: var(--space-4);
+  margin-bottom: var(--space-8);
+}
+
+.onboarding-slot:empty {
+  display: none;
+}
+
 .onboarding-skeleton,
 .onboarding-card,
 .onboarding-collapsed {
@@ -222,73 +229,88 @@ a {
 
 .onboarding-card {
   position: relative;
-  display: grid;
-  gap: var(--space-5);
   overflow: hidden;
-  border: var(--border-weight-subtle) solid var(--border);
-  border-top: var(--border-weight-strong) solid var(--primary);
+  border: var(--border-weight-subtle) solid color-mix(in srgb, var(--primary) 16%, var(--border));
+  box-shadow: var(--shadow-soft);
 }
 
-.onboarding-card::after {
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 9rem;
-  height: 9rem;
-  border-radius: 999px;
-  background: var(--secondary);
-  content: '';
-  opacity: 0.55;
-  pointer-events: none;
-  transform: translate(42%, -58%);
+.onboarding-card-layout {
+  display: grid;
+  min-height: 28rem;
+  grid-template-columns: minmax(0, 1fr) minmax(22rem, 0.72fr);
+}
+
+.onboarding-card-body {
+  z-index: 1;
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: var(--space-5);
+  padding: clamp(var(--space-6), 3vw, var(--space-8));
 }
 
 .onboarding-header {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: var(--space-5);
+  display: block;
 }
 
 .onboarding-header > div {
   display: grid;
-  max-width: 48rem;
+  max-width: 42rem;
   gap: var(--space-2);
+}
+
+.onboarding-header h2 {
+  max-width: 18ch;
+  font-size: var(--type-size-3xl);
+  line-height: var(--type-leading-tight);
+}
+
+.onboarding-progress {
+  max-width: 42rem;
+}
+
+.onboarding-card .onboarding-collapse {
+  position: absolute;
+  z-index: 3;
+  top: var(--space-4);
+  right: var(--space-4);
+  border: var(--border-weight-subtle) solid color-mix(in srgb, var(--primary) 14%, var(--border));
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  box-shadow: var(--shadow-hairline);
 }
 
 .onboarding-steps {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
   padding: 0;
   margin: 0;
   list-style: none;
 }
 
 .onboarding-steps li {
-  position: relative;
   display: grid;
   min-width: 0;
-  grid-template-columns: 2rem minmax(0, 1fr);
-  align-items: start;
-  gap: var(--space-3);
-  padding-right: var(--space-5);
+  min-height: 8.5rem;
+  align-content: start;
+  gap: var(--space-4);
+  border: var(--border-weight-subtle) solid transparent;
+  border-radius: var(--radius-md);
+  background: var(--surface-inset);
+  padding: var(--space-4);
 }
 
-.onboarding-steps li:not(:last-child)::after {
-  position: absolute;
-  z-index: 0;
-  top: 1rem;
-  right: 0;
-  left: 2rem;
-  height: var(--border-weight-subtle);
-  background: var(--border-strong);
-  content: '';
+.onboarding-steps li.current {
+  border-color: color-mix(in srgb, var(--primary) 26%, var(--border));
+  background: color-mix(in srgb, var(--primary) 7%, var(--surface));
+}
+
+.onboarding-steps li.complete {
+  border-color: color-mix(in srgb, var(--success) 24%, var(--border));
+  background: color-mix(in srgb, var(--success) 7%, var(--surface));
 }
 
 .onboarding-step-marker {
-  z-index: 1;
   display: grid;
   width: 2rem;
   height: 2rem;
@@ -314,10 +336,8 @@ a {
 }
 
 .onboarding-steps li > span:last-child {
-  z-index: 1;
   display: grid;
   gap: var(--space-1);
-  background: var(--surface);
 }
 
 .onboarding-steps small,
@@ -342,9 +362,10 @@ a {
 
 .onboarding-mapping {
   display: grid;
-  gap: var(--space-3);
-  border-top: var(--border-weight-subtle) solid var(--border);
-  padding-top: var(--space-4);
+  gap: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-inset);
+  padding: var(--space-4);
 }
 
 .onboarding-mapping-copy,
@@ -367,11 +388,11 @@ a {
 
 .onboarding-mapping-icon {
   display: grid;
-  width: 2rem;
-  height: 2rem;
+  width: 2.5rem;
+  height: 2.5rem;
   flex: 0 0 auto;
   place-items: center;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
   background: var(--secondary);
   color: var(--secondary-foreground);
 }
@@ -386,9 +407,10 @@ a {
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-3);
-  border: var(--border-weight-subtle) solid var(--border);
+  border: var(--border-weight-subtle) solid color-mix(in srgb, var(--primary) 18%, var(--border));
   border-radius: var(--radius-md);
-  background: var(--surface);
+  background: color-mix(in srgb, var(--primary) 4%, var(--surface));
+  box-shadow: var(--shadow-hairline);
   padding: var(--space-3) var(--space-4);
   color: var(--foreground);
   text-align: left;
@@ -405,8 +427,9 @@ a {
 .onboarding-context {
   display: grid;
   gap: var(--space-2);
-  border-left: var(--border-weight-strong) solid var(--primary);
-  background: var(--secondary);
+  border: var(--border-weight-subtle) solid color-mix(in srgb, var(--primary) 16%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--primary) 5%, var(--surface));
   padding: var(--space-4);
 }
 
@@ -444,6 +467,30 @@ a {
 .onboarding-settings-row > span > span {
   display: grid;
   gap: var(--space-1);
+}
+
+.onboarding-art {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface-inset);
+}
+
+.onboarding-art::before {
+  position: absolute;
+  z-index: 1;
+  inset: 0 auto 0 0;
+  width: 24%;
+  background: linear-gradient(90deg, var(--surface), transparent);
+  content: '';
+  pointer-events: none;
+}
+
+.onboarding-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 72% center;
 }
 
 .page-stack {
@@ -864,42 +911,45 @@ a {
 }
 
 .graph-trail {
+  position: relative;
   display: flex;
-  width: max-content;
-  min-width: 0;
-  max-width: 100%;
   min-height: var(--control-hit-target);
   align-items: center;
-  justify-self: start;
-  gap: var(--space-2);
-  overflow: hidden;
-  border: var(--border-weight-subtle) solid color-mix(in srgb, var(--primary) 18%, var(--border));
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--primary) 4%, var(--surface));
-  padding-inline: var(--space-3);
+  gap: var(--space-3);
+  overflow-x: auto;
+  border-bottom: var(--border-weight-subtle) solid var(--border);
+  padding: 0 0 var(--space-3) var(--space-6);
   scrollbar-width: thin;
 }
 
 .trail-origin {
-  width: var(--space-2);
-  height: var(--space-2);
-  flex: 0 0 auto;
-  border: var(--border-weight-subtle) solid var(--primary);
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: var(--space-3);
+  height: var(--space-3);
+  border: var(--border-weight-strong) solid var(--accent-foreground);
   border-radius: var(--radius-pill);
-  background: color-mix(in srgb, var(--primary) 14%, var(--surface));
+  background: var(--accent);
+}
+
+.graph-trail::before {
+  position: absolute;
+  bottom: calc(var(--space-2) - var(--border-weight-subtle));
+  left: var(--space-2);
+  width: var(--space-4);
+  height: var(--border-weight-strong);
+  background: var(--accent-foreground);
+  content: '';
 }
 
 .graph-trail ol {
   display: flex;
-  min-width: 0;
-  flex: 1 1 auto;
   align-items: center;
-  gap: 0;
-  overflow-x: auto;
+  gap: var(--space-1);
   margin: 0;
   padding: 0;
   list-style: none;
-  scrollbar-width: thin;
   white-space: nowrap;
 }
 
@@ -919,26 +969,20 @@ a {
   align-items: center;
   justify-content: center;
   color: var(--muted-foreground);
-  padding-inline: var(--space-1);
   text-underline-offset: var(--space-1);
 }
 
 .graph-trail [aria-current='page'] {
-  display: inline-flex;
-  min-height: var(--control-hit-target);
-  align-items: center;
   color: var(--accent-foreground);
   font-weight: var(--type-weight-semibold);
-  padding-inline: var(--space-1);
 }
 
 .trail-depth {
   flex: 0 0 auto;
-  border-left: var(--border-weight-subtle) solid var(--border);
+  margin-left: auto;
   color: var(--muted-foreground);
   font-family: var(--font-mono);
   font-size: var(--type-size-xs);
-  padding-left: var(--space-3);
   white-space: nowrap;
 }
 
@@ -1939,17 +1983,31 @@ a {
     padding-block: var(--space-6);
   }
 
-  .onboarding-card {
+  .onboarding-card-layout {
+    min-height: 0;
+    grid-template-columns: 1fr;
+  }
+
+  .onboarding-card-body {
+    grid-row: 2;
     padding: var(--space-5);
   }
 
-  .onboarding-header {
-    align-items: stretch;
-    flex-direction: column;
+  .onboarding-art {
+    grid-row: 1;
+    min-height: 11rem;
+    max-height: 13rem;
   }
 
-  .onboarding-header > button {
-    align-self: start;
+  .onboarding-art::before {
+    inset: auto 0 0;
+    width: auto;
+    height: 24%;
+    background: linear-gradient(0deg, var(--surface), transparent);
+  }
+
+  .onboarding-art img {
+    object-position: 58% 54%;
   }
 
   .onboarding-steps {
@@ -1959,15 +2017,10 @@ a {
 
   .onboarding-steps li {
     min-height: var(--control-hit-target);
-    padding-right: 0;
-  }
-
-  .onboarding-steps li:not(:last-child)::after {
-    top: 2rem;
-    bottom: calc(var(--space-3) * -1);
-    left: 1rem;
-    width: var(--border-weight-subtle);
-    height: auto;
+    grid-template-columns: 2rem minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-3);
+    padding: var(--space-3);
   }
 
   .onboarding-controls,
@@ -2140,8 +2193,8 @@ a {
     padding-inline: var(--space-4);
   }
 
-  .graph-trail {
-    width: 100%;
+  .onboarding-art {
+    min-height: 9rem;
   }
 
   .node-person {
@@ -2239,7 +2292,7 @@ a {
 @media (forced-colors: active) {
   .nav-link.active::before,
   .login-thread,
-  .trail-origin,
+  .graph-trail::before,
   .repo-connector {
     background: Highlight;
   }

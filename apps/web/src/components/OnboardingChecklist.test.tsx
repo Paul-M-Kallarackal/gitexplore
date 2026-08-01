@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { ThemeProvider } from 'strawn';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const api = vi.hoisted(() => ({
   getOnboardingProgress: vi.fn(),
@@ -63,6 +63,8 @@ function renderOnboarding() {
 }
 
 describe('OnboardingChecklist', () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     vi.clearAllMocks();
     api.getOnboardingProgress.mockResolvedValue(notStarted);
@@ -107,6 +109,22 @@ describe('OnboardingChecklist', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Skip onboarding' }));
     await waitFor(() => expect(api.dismissOnboarding).toHaveBeenCalledTimes(1));
+  });
+
+  it('uses decorative atlas artwork and collapses to a compact progress control', async () => {
+    const user = userEvent.setup();
+    api.getOnboardingProgress.mockResolvedValue(inProgress);
+    const view = renderOnboarding();
+
+    await view.findByRole('heading', { name: 'Your first GitExplore trail' });
+    const artwork = view.getByTestId('onboarding-artwork').querySelector('img');
+    expect(artwork).toHaveAttribute('src', '/images/gitexplore-onboarding-atlas.webp');
+    expect(artwork).toHaveAttribute('alt', '');
+    expect(view.queryByText(/replay it any time/i)).not.toBeInTheDocument();
+
+    await user.click(view.getByRole('button', { name: 'Collapse' }));
+    expect(view.getByRole('button', { name: /your first trail/i })).toHaveAttribute('aria-expanded', 'false');
+    await waitFor(() => expect(view.queryByTestId('onboarding-artwork')).not.toBeInTheDocument());
   });
 
   it('completes only after all real-action flags are present', async () => {

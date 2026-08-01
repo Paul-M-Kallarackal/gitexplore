@@ -8,7 +8,7 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   CircleAlertIcon,
-  DatabaseIcon,
+  GlobeIcon,
   MapPinIcon,
 } from 'strawn-icons';
 
@@ -85,7 +85,7 @@ function MappingOption() {
   return (
     <div className="onboarding-mapping">
       <div className="onboarding-mapping-copy">
-        <span className="onboarding-mapping-icon" aria-hidden="true"><DatabaseIcon size={17} /></span>
+        <span className="onboarding-mapping-icon" aria-hidden="true"><GlobeIcon size={17} /></span>
         <div>
           <strong>Warm your discovery map</strong>
           <Text size="xs" color="$mutedForeground">
@@ -170,46 +170,61 @@ export function OnboardingChecklist() {
   }
 
   return (
-    <Surface as="section" className="onboarding-card" tone="default" radius="lg" padding="lg" aria-labelledby="onboarding-title">
-      <div className="onboarding-header">
-        <div>
-          <Text size="xs" color="$mutedForeground">Field guide · {completed} of 3 complete</Text>
-          <Heading id="onboarding-title" size="h2">Your first GitExplore trail</Heading>
-          <Text size="sm" color="$mutedForeground">Find useful work through people you trust, then keep the find privately.</Text>
-        </div>
-        <Button variant="ghost" size="sm" rightIcon={<ChevronUpIcon aria-hidden="true" size={15} />} onClick={() => setCollapsed(true)} aria-expanded="true">
+    <Surface as="section" className="onboarding-card" tone="default" radius="lg" padding="none" aria-labelledby="onboarding-title">
+      <div className="onboarding-card-layout">
+        <Button className="onboarding-collapse" variant="ghost" size="sm" rightIcon={<ChevronUpIcon aria-hidden="true" size={15} />} onClick={() => setCollapsed(true)} aria-expanded="true">
           Collapse
         </Button>
+        <div className="onboarding-card-body">
+          <div className="onboarding-header">
+            <div>
+              <Text size="xs" color="$mutedForeground">Field guide · {completed} of 3 complete</Text>
+              <Heading id="onboarding-title" size="h2">Your first GitExplore trail</Heading>
+              <Text size="sm" color="$mutedForeground">Follow a trusted path to useful work, then keep the find private.</Text>
+            </div>
+          </div>
+          <div className="onboarding-progress">
+            <Progress label={`${completed} of 3 onboarding steps complete`} value={completed} max={3} size="sm" />
+          </div>
+          <ol className="onboarding-steps">
+            {steps.map((step, index) => {
+              const done = stepComplete(step.key, progress);
+              const current = currentStep === step.key;
+              return (
+                <li key={step.key} className={done ? 'complete' : current ? 'current' : ''} aria-current={current ? 'step' : undefined}>
+                  <span className="onboarding-step-marker" aria-hidden="true">{done ? <CheckIcon size={14} /> : index + 1}</span>
+                  <span><strong>{step.label}</strong><small>{step.detail}</small></span>
+                </li>
+              );
+            })}
+          </ol>
+          <div className="onboarding-controls">
+            <CurrentStepAction step={currentStep} login={login} />
+            <Button
+              variant="ghost"
+              size="sm"
+              loading={dismissPending}
+              onClick={() => {
+                setSkipRequested(true);
+                dismiss();
+              }}
+            >
+              Skip onboarding
+            </Button>
+          </div>
+          <MappingOption />
+        </div>
+        <picture className="onboarding-art" aria-hidden="true" data-testid="onboarding-artwork">
+          <source media="(max-width: 48rem)" srcSet="/images/gitexplore-onboarding-atlas-mobile.webp" />
+          <img
+            src="/images/gitexplore-onboarding-atlas.webp"
+            width="1080"
+            height="720"
+            alt=""
+            decoding="async"
+          />
+        </picture>
       </div>
-      <Progress label={`${completed} of 3 onboarding steps complete`} value={completed} max={3} size="sm" />
-      <ol className="onboarding-steps">
-        {steps.map((step, index) => {
-          const done = stepComplete(step.key, progress);
-          const current = currentStep === step.key;
-          return (
-            <li key={step.key} className={done ? 'complete' : current ? 'current' : ''} aria-current={current ? 'step' : undefined}>
-              <span className="onboarding-step-marker" aria-hidden="true">{done ? <CheckIcon size={14} /> : index + 1}</span>
-              <span><strong>{step.label}</strong><small>{step.detail}</small></span>
-            </li>
-          );
-        })}
-      </ol>
-      <div className="onboarding-controls">
-        <CurrentStepAction step={currentStep} login={login} />
-        <Button
-          variant="ghost"
-          size="sm"
-          loading={dismissPending}
-          onClick={() => {
-            setSkipRequested(true);
-            dismiss();
-          }}
-        >
-          Skip onboarding
-        </Button>
-        <Text size="xs" color="$mutedForeground">Replay it any time from Settings.</Text>
-      </div>
-      <MappingOption />
     </Surface>
   );
 }
