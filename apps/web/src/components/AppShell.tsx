@@ -72,8 +72,10 @@ function AppShellContent() {
         {rateQuery.data ? <span className="numeric-caption">{rateQuery.data.remaining.toLocaleString()} requests</span> : null}
       </header>
       <main id="main-content" className="app-main" tabIndex={-1}>
-        <OnboardingCompletion />
-        <OnboardingChecklist />
+        <div className="onboarding-slot">
+          <OnboardingCompletion />
+          <OnboardingChecklist />
+        </div>
         <Outlet />
       </main>
       <nav className="mobile-nav" aria-label="Primary">

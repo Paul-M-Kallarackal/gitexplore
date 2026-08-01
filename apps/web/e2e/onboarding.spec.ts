@@ -169,3 +169,57 @@ test('skip remains dismissed after a reload', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Your first GitExplore trail' })).toBeHidden();
   await expect(page.getByRole('heading', { name: /Whose GitHub world/ })).toBeVisible();
 });
+
+test('atlas onboarding stays composed without cut-through connectors', async ({ page }, testInfo) => {
+  await mockGitExplore(page);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto('/app/explore');
+
+  const card = page.locator('.onboarding-card');
+  const artwork = card.locator('.onboarding-art img');
+  await expect(card).toBeVisible();
+  await expect(artwork).toBeVisible();
+  await expect.poll(() => artwork.evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+
+  const connectorContent = await card.locator('.onboarding-steps li').evaluateAll((items) => (
+    items.map((item) => getComputedStyle(item, '::after').content)
+  ));
+  expect(connectorContent.every((content) => content === 'none')).toBe(true);
+
+  const cardBox = await card.boundingBox();
+  const artworkBox = await card.locator('.onboarding-art').boundingBox();
+  expect(cardBox).not.toBeNull();
+  expect(artworkBox).not.toBeNull();
+  expect(artworkBox!.x).toBeGreaterThan(cardBox!.x + cardBox!.width * 0.55);
+  await testInfo.attach('onboarding-desktop', {
+    body: await card.screenshot({ animations: 'disabled' }),
+    contentType: 'image/png',
+  });
+  if (process.env.GITEXPLORE_VISUAL_OUTPUT_DIR) {
+    await card.screenshot({
+      animations: 'disabled',
+      path: `${process.env.GITEXPLORE_VISUAL_OUTPUT_DIR}/onboarding-desktop.png`,
+    });
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(card).toBeVisible();
+  const mobileArtBox = await card.locator('.onboarding-art').boundingBox();
+  const mobileBodyBox = await card.locator('.onboarding-card-body').boundingBox();
+  expect(mobileArtBox).not.toBeNull();
+  expect(mobileBodyBox).not.toBeNull();
+  expect(mobileArtBox!.y).toBeLessThan(mobileBodyBox!.y);
+  expect((await new AxeBuilder({ page }).include('.onboarding-card').analyze()).violations).toEqual([]);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await testInfo.attach('onboarding-mobile', {
+    body: await page.screenshot({ animations: 'disabled', fullPage: true }),
+    contentType: 'image/png',
+  });
+  if (process.env.GITEXPLORE_VISUAL_OUTPUT_DIR) {
+    await page.screenshot({
+      animations: 'disabled',
+      fullPage: true,
+      path: `${process.env.GITEXPLORE_VISUAL_OUTPUT_DIR}/onboarding-mobile.png`,
+    });
+  }
+});
