@@ -14,6 +14,7 @@ use crate::{
         RepositoryContributorInsights, RepositoryContributorsSnapshot,
         UserCommitRepositoriesSnapshot, UserCommitRepositoryInsights,
     },
+    onboarding::{OnboardingProgress, OnboardingRecord},
     shared::{AppError, AppResult},
 };
 
@@ -167,6 +168,12 @@ pub trait SyncStateRepository: Send + Sync {
         warmup: DiscoveryWarmupJob,
         lease: &RefreshLease,
     ) -> AppResult<bool>;
+    async fn onboarding_record(&self, user_id: &str) -> AppResult<Option<OnboardingRecord>>;
+    async fn save_onboarding_record(
+        &self,
+        user_id: &str,
+        record: OnboardingRecord,
+    ) -> AppResult<()>;
 }
 
 #[async_trait]
@@ -406,4 +413,13 @@ pub trait InsightService: Send + Sync {
         login: &str,
         limit: usize,
     ) -> AppResult<UserCommitRepositoryInsights>;
+}
+
+#[async_trait]
+pub trait OnboardingService: Send + Sync {
+    async fn progress(&self, user_id: &str) -> AppResult<OnboardingProgress>;
+    async fn begin(&self, user_id: &str) -> AppResult<OnboardingProgress>;
+    async fn dismiss(&self, user_id: &str) -> AppResult<OnboardingProgress>;
+    async fn restart(&self, user_id: &str) -> AppResult<OnboardingProgress>;
+    async fn complete(&self, user_id: &str) -> AppResult<OnboardingProgress>;
 }

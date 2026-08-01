@@ -32,11 +32,14 @@ use crate::{
         PendingBrowserLogin,
     },
     insights::{RepositoryContributorInsights, UserCommitRepositoryInsights},
+    onboarding::{
+        CURRENT_ONBOARDING_VERSION, OnboardingProgress, OnboardingRecord, OnboardingStatus,
+    },
     ports::{
         BookmarkRepository, BookmarkService, CategoryRepository, DiscoveryRepository,
         DiscoveryService, ExplorationRepository, ExplorationService, GitHubAuthConfig,
         GitHubClientPort, GitHubImportRepository, GitHubSyncService, IdentityRepository,
-        IdentityService, InsightRepository, InsightService, SyncStateRepository,
+        IdentityService, InsightRepository, InsightService, OnboardingService, SyncStateRepository,
     },
     shared::{AppError, AppResult, GITHUB_CORE_REST_MINIMUM_RESERVE, ensure},
 };
@@ -49,6 +52,7 @@ pub struct AppServices {
     pub exploration: Arc<dyn ExplorationService>,
     pub discovery: Arc<dyn DiscoveryService>,
     pub insights: Arc<dyn InsightService>,
+    pub onboarding: Arc<dyn OnboardingService>,
 }
 
 #[derive(Clone)]
@@ -100,14 +104,14 @@ impl AppServices {
         let bookmarks = Arc::new(DefaultBookmarkService {
             import_repo: import_repo.clone(),
             category_repo,
-            bookmark_repo,
+            bookmark_repo: bookmark_repo.clone(),
         });
         let exploration = Arc::new(DefaultExplorationService { exploration_repo });
         let discovery = Arc::new(DefaultDiscoveryService {
             identity_repo: identity_repo.clone(),
             import_repo: import_repo.clone(),
-            sync_state_repo,
-            discovery_repo,
+            sync_state_repo: sync_state_repo.clone(),
+            discovery_repo: discovery_repo.clone(),
             github: github.clone(),
             refreshes,
             rate_budgets: rate_budgets.clone(),
@@ -121,6 +125,11 @@ impl AppServices {
             rate_budgets,
             cold_refreshes: InsightColdRefreshCoordinator::default(),
         });
+        let onboarding = Arc::new(DefaultOnboardingService {
+            sync_state_repo,
+            bookmark_repo,
+            discovery_repo,
+        });
 
         Self {
             identity,
@@ -129,6 +138,7 @@ impl AppServices {
             exploration,
             discovery,
             insights,
+            onboarding,
         }
     }
 }
@@ -794,6 +804,143 @@ impl ExplorationService for DefaultExplorationService {
         self.exploration_repo
             .list_exploration_snapshots(user_id)
             .await
+    }
+}
+
+pub struct DefaultOnboardingService {
+    sync_state_repo: Arc<dyn SyncStateRepository>,
+    bookmark_repo: Arc<dyn BookmarkRepository>,
+    discovery_repo: Arc<dyn DiscoveryRepository>,
+}
+
+impl DefaultOnboardingService {
+    async fn current_record(&self, user_id: &str) -> AppResult<Option<OnboardingRecord>> {
+        Ok(self
+            .sync_state_repo
+            .onboarding_record(user_id)
+            .await?
+            .filter(|record| record.version == CURRENT_ONBOARDING_VERSION))
+    }
+
+    async fn progress_for_record(
+        &self,
+        user_id: &str,
+        record: OnboardingRecord,
+    ) -> AppResult<OnboardingProgress> {
+        let (activity, bookmarks, warmup) = tokio::try_join!(
+            self.discovery_repo
+                .exploration_activity(user_id, MAX_RECENT_PEOPLE),
+            self.bookmark_repo.list_bookmarks(user_id),
+            self.sync_state_repo.discovery_warmup(user_id),
+        )?;
+
+        let (opened_trailhead, followed_connection, saved_repository) =
+            if record.status == OnboardingStatus::Completed {
+                (true, true, true)
+            } else if let Some(started_at) = record.started_at {
+                let recent_visits = activity
+                    .recent_people
+                    .iter()
+                    .filter(|person| person.last_viewed_at >= started_at)
+                    .collect::<Vec<_>>();
+                (
+                    !recent_visits.is_empty(),
+                    recent_visits.iter().any(|person| person.trail.len() >= 2),
+                    bookmarks.iter().any(|bookmark| {
+                        bookmark.created_at >= started_at
+                            && matches!(bookmark.target, BookmarkTarget::GitHubRepository { .. })
+                    }),
+                )
+            } else {
+                (false, false, false)
+            };
+
+        Ok(OnboardingProgress {
+            version: record.version,
+            status: record.status,
+            started_at: record.started_at,
+            completed_at: record.completed_at,
+            dismissed_at: record.dismissed_at,
+            opened_trailhead,
+            followed_connection,
+            saved_repository,
+            mapping_started: warmup.is_some(),
+        })
+    }
+}
+
+#[async_trait]
+impl OnboardingService for DefaultOnboardingService {
+    async fn progress(&self, user_id: &str) -> AppResult<OnboardingProgress> {
+        let Some(record) = self.current_record(user_id).await? else {
+            return Ok(OnboardingProgress::not_started());
+        };
+        self.progress_for_record(user_id, record).await
+    }
+
+    async fn begin(&self, user_id: &str) -> AppResult<OnboardingProgress> {
+        if let Some(record) = self.current_record(user_id).await? {
+            return self.progress_for_record(user_id, record).await;
+        }
+        let record = OnboardingRecord::in_progress(Utc::now());
+        self.sync_state_repo
+            .save_onboarding_record(user_id, record.clone())
+            .await?;
+        self.progress_for_record(user_id, record).await
+    }
+
+    async fn dismiss(&self, user_id: &str) -> AppResult<OnboardingProgress> {
+        let now = Utc::now();
+        let mut record = self
+            .current_record(user_id)
+            .await?
+            .unwrap_or_else(|| OnboardingRecord::in_progress(now));
+        if record.status != OnboardingStatus::Completed {
+            record.status = OnboardingStatus::Dismissed;
+            record.started_at.get_or_insert(now);
+            record.completed_at = None;
+            record.dismissed_at = Some(now);
+            self.sync_state_repo
+                .save_onboarding_record(user_id, record.clone())
+                .await?;
+        }
+        self.progress_for_record(user_id, record).await
+    }
+
+    async fn restart(&self, user_id: &str) -> AppResult<OnboardingProgress> {
+        let record = OnboardingRecord::in_progress(Utc::now());
+        self.sync_state_repo
+            .save_onboarding_record(user_id, record.clone())
+            .await?;
+        self.progress_for_record(user_id, record).await
+    }
+
+    async fn complete(&self, user_id: &str) -> AppResult<OnboardingProgress> {
+        let Some(mut record) = self.current_record(user_id).await? else {
+            return Err(AppError::Validation(
+                "onboarding must be started before it can be completed".to_string(),
+            ));
+        };
+        if record.status == OnboardingStatus::Completed {
+            return self.progress_for_record(user_id, record).await;
+        }
+        ensure(
+            record.status == OnboardingStatus::InProgress,
+            "onboarding must be active before it can be completed",
+        )?;
+        let progress = self.progress_for_record(user_id, record.clone()).await?;
+        ensure(
+            progress.required_steps_complete(),
+            "open a trailhead, follow a connection, and save a repository before completing onboarding",
+        )?;
+        let now = Utc::now();
+        record.status = OnboardingStatus::Completed;
+        record.completed_at = Some(now);
+        record.dismissed_at = None;
+        self.sync_state_repo
+            .save_onboarding_record(user_id, record.clone())
+            .await?;
+        self.progress_for_record(user_id, record).await
     }
 }
 

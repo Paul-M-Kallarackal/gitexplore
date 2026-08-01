@@ -13,6 +13,7 @@ import { RepositoryCandidateCard } from '../components/RepositoryCandidateCard';
 import { UserInsights } from '../components/UserInsights';
 import { isLikelyGitHubLogin, normalizeConnectionDirection, normalizeLoginInput, normalizeTrail, setConnectionDirection } from '../lib/graph-navigation';
 import { cacheLabel, compactNumber } from '../lib/format';
+import { useOnboarding } from '../onboarding';
 import { useDocumentTitle } from '../useDocumentTitle';
 
 const neighborhoodLimit = 36;
@@ -68,6 +69,7 @@ export function UserExplorerPage() {
   const { login: rawLogin = '' } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const { active: onboardingActive, currentStep: onboardingStep, refreshProgress } = useOnboarding();
   const attemptedAutoExpansions = useRef(new Set<string>());
   const attemptedVisitKeys = useRef(new Set<string>());
   const [visibleRepositories, setVisibleRepositories] = useState(8);
@@ -140,6 +142,7 @@ export function UserExplorerPage() {
         ...current,
         [variables.visitKey]: { status: 'success' },
       }));
+      void refreshProgress();
     },
     onError: (error, variables) => {
       setVisitWrites((current) => ({
@@ -245,6 +248,7 @@ export function UserExplorerPage() {
         repositories: current.repositories.map((candidate) => candidate.repository.fullName === fullName ? { ...candidate, saved: true } : candidate),
       }) : current);
       void queryClient.invalidateQueries({ queryKey: ['bookmarks'] });
+      void refreshProgress();
     },
   });
 
@@ -470,7 +474,14 @@ export function UserExplorerPage() {
       )}
 
       <div className="atlas-grid">
-        <aside className="connection-panel" aria-label="Connections">
+        <aside id="connections" className="connection-panel onboarding-focus-target" aria-label="Connections" tabIndex={-1}>
+          {onboardingActive && onboardingStep === 'connection' ? (
+            <div className="onboarding-context" role="status">
+              <Text size="xs" color="$mutedForeground">Step 2 of 3</Text>
+              <Heading size="h3">Follow a human signal</Heading>
+              <Text size="sm" color="$mutedForeground">Choose any follower or following account. Your trail stays visible as you move.</Text>
+            </div>
+          ) : null}
           <Tabs
             label="Connection direction"
             value={direction}
@@ -516,7 +527,7 @@ export function UserExplorerPage() {
             )}
           </div>
 
-          <section className="discoveries" aria-labelledby="discoveries-title">
+          <section id="discoveries" className="discoveries onboarding-focus-target" aria-labelledby="discoveries-title" tabIndex={-1}>
             <div className="section-heading-row discoveries-heading">
               <div>
                 <Text size="xs" color="$mutedForeground">Ranked discoveries</Text>
@@ -525,6 +536,13 @@ export function UserExplorerPage() {
               </div>
               <Badge tone="neutral" leadingIcon={<UsersIcon aria-hidden="true" size={14} />}>{neighborhood.repositories.length} found</Badge>
             </div>
+            {onboardingActive && onboardingStep === 'repository' ? (
+              <div className="onboarding-context" role="status">
+                <Text size="xs" color="$mutedForeground">Step 3 of 3</Text>
+                <Heading size="h3">Keep one promising find</Heading>
+                <Text size="sm" color="$mutedForeground">Save any ranked repository below. It goes to your private field notebook in one click.</Text>
+              </div>
+            ) : null}
             {displayedRepositories.length ? (
               <div className="repository-results">
                 {displayedRepositories.map((candidate, index) => (

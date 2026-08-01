@@ -7,6 +7,7 @@ import { ArrowRightIcon, BookmarkIcon, CircleAlertIcon, FolderIcon, HistoryIcon,
 
 import { api } from '../api';
 import { bookmarkKind, describeBookmarkTarget, formatTimestamp, seedLabel, snapshotSummary } from '../lib/format';
+import { useOnboarding } from '../onboarding';
 import { buildExploreHref, isLikelyGitHubLogin, normalizeLoginInput } from '../lib/graph-navigation';
 import { useDocumentTitle } from '../useDocumentTitle';
 
@@ -65,6 +66,7 @@ export function SavedPage() {
 
 function BookmarksView() {
   const queryClient = useQueryClient();
+  const { refreshProgress } = useOnboarding();
   const [search, setSearch] = useState('');
   const [targetKind, setTargetKind] = useState<'repository' | 'user'>('repository');
   const [targetValue, setTargetValue] = useState('');
@@ -89,6 +91,7 @@ function BookmarksView() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['bookmarks'] }),
         queryClient.invalidateQueries({ queryKey: ['user-neighborhood'] }),
+        refreshProgress(),
       ]);
     },
     retry: false,

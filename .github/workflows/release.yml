@@ -74,6 +74,7 @@ jobs:
           pnpm --filter @gitexplore/api-client test
           pnpm --filter @gitexplore/web check
           pnpm --filter @gitexplore/web test
+          pnpm --filter @gitexplore/web test:e2e
           pnpm check
 
       - name: Enforce production contract

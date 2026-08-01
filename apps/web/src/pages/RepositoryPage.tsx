@@ -8,6 +8,7 @@ import { api } from '../api';
 import { GraphTrail } from '../components/GraphTrail';
 import { buildExploreHref, normalizeConnectionDirection, parseTrail, type ConnectionDirection } from '../lib/graph-navigation';
 import { cacheLabel, compactNumber, formatTimestamp } from '../lib/format';
+import { useOnboarding } from '../onboarding';
 import { useDocumentTitle } from '../useDocumentTitle';
 
 const ownerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -17,6 +18,7 @@ export function RepositoryPage() {
   const { owner = '', repo = '' } = useParams();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const { refreshProgress } = useOnboarding();
   const fullName = `${owner}/${repo}`;
   const valid = ownerPattern.test(owner) && repositoryPattern.test(repo);
   const trail = useMemo(() => parseTrail(searchParams.get('trail')), [searchParams]);
@@ -46,6 +48,7 @@ export function RepositoryPage() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['bookmarks'] }),
         queryClient.invalidateQueries({ queryKey: ['user-neighborhood'] }),
+        refreshProgress(),
       ]);
     },
     retry: false,

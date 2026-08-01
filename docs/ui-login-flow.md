@@ -75,6 +75,8 @@ The React auth boundary waits for the status query before resolving `/app`. If t
 
 Browser requests target the page origin and use `credentials: "include"`. During development, Vite proxies API paths to the Rust service; Docker Compose sets the server-only proxy target to `http://gitexplore:4000`. In production, Vercel routes those same paths to the Rust service under the single GitExplore origin. All frontend data loading happens in the browser, with no browser-exposed API-origin setting.
 
+Once the shell is available it reads `onboardingProgress`. Missing version-one state opens the embedded first-value guide without changing the OAuth return path or current route. The guide begins only lifecycle timing; GitHub discovery warmup remains an explicit optional action. Completion, dismissal, and replay are stored on the canonical private app-user overlay.
+
 ### 5. Sign out
 
 The application shell calls:

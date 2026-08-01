@@ -45,6 +45,7 @@ use crate::{
         USER_COMMIT_ACTIVITY_WINDOW_DAYS, UserCommitRepositoriesSnapshot, UserCommitRepository,
         UserCommitRepositoryInsights, refresh_is_active,
     },
+    onboarding::{OnboardingRecord, OnboardingStatus},
     ports::{
         BookmarkRepository, CategoryRepository, DeviceLoginStart, DiscoveryRepository,
         ExplorationRepository, GitHubAuthConfig, GitHubClientPort, GitHubImportRepository,
@@ -608,6 +609,8 @@ struct GraphStore {
     sync_status: HashMap<String, SyncStatus>,
     #[serde(default)]
     discovery_warmups: HashMap<String, DiscoveryWarmupJob>,
+    #[serde(default)]
+    onboarding: HashMap<String, OnboardingRecord>,
     shared: SharedGraphStore,
     categories: HashMap<String, Vec<Category>>,
     bookmarks: HashMap<String, Vec<Bookmark>>,
@@ -1537,6 +1540,20 @@ impl SyncStateRepository for LocalSyncStateRepository {
         guard.discovery_warmups.insert(user_id.to_string(), warmup);
         self.store.persist(&guard)?;
         Ok(true)
+    }
+
+    async fn onboarding_record(&self, user_id: &str) -> AppResult<Option<OnboardingRecord>> {
+        Ok(self.store.lock()?.onboarding.get(user_id).cloned())
+    }
+
+    async fn save_onboarding_record(
+        &self,
+        user_id: &str,
+        record: OnboardingRecord,
+    ) -> AppResult<()> {
+        let mut guard = self.store.lock()?;
+        guard.onboarding.insert(user_id.to_string(), record);
+        self.store.persist(&guard)
     }
 }
 
@@ -5268,6 +5285,120 @@ impl SyncStateRepository for Neo4jSyncStateRepository {
             return Ok(false);
         };
         row.get::<bool>("updated").map_err(map_neo4j_decode)
+    }
+
+    async fn onboarding_record(&self, user_id: &str) -> AppResult<Option<OnboardingRecord>> {
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (local:LocalUser {id: $user_id})
+                     WHERE local.onboarding_version IS NOT NULL
+                     RETURN local.onboarding_version AS version,
+                            local.onboarding_status AS status,
+                            toString(local.onboarding_started_at) AS started_at,
+                            toString(local.onboarding_completed_at) AS completed_at,
+                            toString(local.onboarding_dismissed_at) AS dismissed_at
+                     LIMIT 1",
+                )
+                .param("user_id", user_id.to_string()),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let version = row.get::<i64>("version").map_err(map_neo4j_decode)?;
+        let version = i32::try_from(version)
+            .map_err(|_| AppError::Storage("onboarding version is out of range".to_string()))?;
+        let status =
+            parse_onboarding_status(&row.get::<String>("status").map_err(map_neo4j_decode)?)?;
+        let started_at = row
+            .get::<Option<String>>("started_at")
+            .map_err(map_neo4j_decode)?
+            .and_then(|value| parse_timestamp(&value));
+        let completed_at = row
+            .get::<Option<String>>("completed_at")
+            .map_err(map_neo4j_decode)?
+            .and_then(|value| parse_timestamp(&value));
+        let dismissed_at = row
+            .get::<Option<String>>("dismissed_at")
+            .map_err(map_neo4j_decode)?
+            .and_then(|value| parse_timestamp(&value));
+        Ok(Some(OnboardingRecord {
+            version,
+            status,
+            started_at,
+            completed_at,
+            dismissed_at,
+        }))
+    }
+
+    async fn save_onboarding_record(
+        &self,
+        user_id: &str,
+        record: OnboardingRecord,
+    ) -> AppResult<()> {
+        self.client
+            .run(
+                query(
+                    "MERGE (local:LocalUser {id: $user_id})
+                     SET local.onboarding_version = $version,
+                         local.onboarding_status = $status,
+                         local.onboarding_started_at = CASE
+                           WHEN $started_at = '' THEN null ELSE datetime($started_at)
+                         END,
+                         local.onboarding_completed_at = CASE
+                           WHEN $completed_at = '' THEN null ELSE datetime($completed_at)
+                         END,
+                         local.onboarding_dismissed_at = CASE
+                           WHEN $dismissed_at = '' THEN null ELSE datetime($dismissed_at)
+                         END",
+                )
+                .param("user_id", user_id.to_string())
+                .param("version", i64::from(record.version))
+                .param("status", record.status.as_str().to_string())
+                .param(
+                    "started_at",
+                    record
+                        .started_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_default(),
+                )
+                .param(
+                    "completed_at",
+                    record
+                        .completed_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_default(),
+                )
+                .param(
+                    "dismissed_at",
+                    record
+                        .dismissed_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_default(),
+                ),
+            )
+            .await
+    }
+}
+
+fn parse_onboarding_status(value: &str) -> AppResult<OnboardingStatus> {
+    match value {
+        "not_started" => Ok(OnboardingStatus::NotStarted),
+        "in_progress" => Ok(OnboardingStatus::InProgress),
+        "completed" => Ok(OnboardingStatus::Completed),
+        "dismissed" => Ok(OnboardingStatus::Dismissed),
+        _ => Err(AppError::Storage(format!(
+            "stored onboarding status `{value}` is invalid"
+        ))),
     }
 }
 

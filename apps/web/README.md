@@ -30,6 +30,8 @@ Docker Compose supplies `http://gitexplore:4000` as that proxy target inside its
 
 The router redirects the former bookmarks, categories, snapshots, and sync URLs into the matching Saved or Settings view.
 
+Authenticated routes share a versioned first-value onboarding provider. The non-blocking guide tracks real profile visits, valid connection trails, and repository saves through cookie-authenticated GraphQL state. It can be skipped or replayed from Settings, and its optional discovery mapping action never runs without an explicit click.
+
 ## Verify and build
 
 ```bash
