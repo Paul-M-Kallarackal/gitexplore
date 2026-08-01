@@ -6,7 +6,7 @@ use crate::{
     discovery::{RepositoryCandidate, UserNeighborhood},
     exploration::{ExplorationResult, ExplorationSeed, ExplorationSnapshot},
     graph::{
-        GitHubRateLimitLease, GitHubRateLimitStatus, GraphImport, RefreshLease,
+        DiscoveryWarmupJob, GitHubRateLimitLease, GitHubRateLimitStatus, GraphImport, RefreshLease,
         RefreshLeaseAttempt, RefreshLeaseState, SyncStatus, SyncSummary,
     },
     identity::{AuthSessionResult, CompletedBrowserLogin, GitHubConnection, PendingBrowserLogin},
@@ -149,6 +149,24 @@ pub trait GitHubImportRepository: Send + Sync {
 pub trait SyncStateRepository: Send + Sync {
     async fn sync_status(&self, user_id: &str) -> AppResult<SyncStatus>;
     async fn set_sync_status(&self, user_id: &str, status: SyncStatus) -> AppResult<()>;
+    async fn start_discovery_warmup(
+        &self,
+        user_id: &str,
+        initial: DiscoveryWarmupJob,
+    ) -> AppResult<DiscoveryWarmupJob>;
+    async fn resume_discovery_warmup_after_reset(
+        &self,
+        user_id: &str,
+        resumed: DiscoveryWarmupJob,
+    ) -> AppResult<DiscoveryWarmupJob>;
+    async fn discovery_warmup(&self, user_id: &str) -> AppResult<Option<DiscoveryWarmupJob>>;
+    async fn runnable_discovery_warmups(&self, limit: usize) -> AppResult<Vec<String>>;
+    async fn save_discovery_warmup_under_lease(
+        &self,
+        user_id: &str,
+        warmup: DiscoveryWarmupJob,
+        lease: &RefreshLease,
+    ) -> AppResult<bool>;
 }
 
 #[async_trait]
@@ -333,6 +351,9 @@ pub trait DiscoveryService: Send + Sync {
         login: &str,
         request_reserve: usize,
     ) -> AppResult<UserNeighborhood>;
+    async fn start_warmup(&self, user_id: &str) -> AppResult<DiscoveryWarmupJob>;
+    async fn warmup_status(&self, user_id: &str) -> AppResult<Option<DiscoveryWarmupJob>>;
+    async fn resume_warmups(&self) -> AppResult<()>;
 }
 
 #[async_trait]

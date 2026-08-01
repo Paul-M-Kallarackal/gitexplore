@@ -191,6 +191,46 @@ describe('createGitExploreApi', () => {
     });
   });
 
+  it('starts and reads the authenticated discovery warmup through GraphQL', async () => {
+    const fetchMock = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { query: string };
+      const warmup = {
+        id: 'warmup-1',
+        seedLogin: 'octocat',
+        status: 'QUEUED',
+        currentLogin: null,
+        expandedUsers: 0,
+        discoveredUsers: 1,
+        pendingUsers: 1,
+        frontierTruncated: false,
+        remainingRequests: null,
+        reserveRequests: 1000,
+        resetAt: null,
+        startedAt: '2026-08-01T10:00:00Z',
+        updatedAt: '2026-08-01T10:00:00Z',
+        completedAt: null,
+        lastError: null
+      };
+      return Response.json({
+        data: body.query.includes('mutation StartDiscoveryWarmup')
+          ? { startDiscoveryWarmup: warmup }
+          : { discoveryWarmup: warmup }
+      });
+    });
+    const api = createGitExploreApi({
+      baseUrl: 'http://localhost:4000',
+      fetch: fetchMock as typeof fetch
+    });
+
+    const started = await api.startDiscoveryWarmup();
+    const status = await api.getDiscoveryWarmup();
+
+    expect(started.id).toBe('warmup-1');
+    expect(status).toMatchObject({ seedLogin: 'octocat', reserveRequests: 1000 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: 'include' });
+  });
+
   it('preserves GraphQL database-capacity details', async () => {
     const fetchMock = vi.fn(async () =>
       Response.json({

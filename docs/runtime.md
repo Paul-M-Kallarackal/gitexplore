@@ -7,7 +7,7 @@ The compose stack is the intended local Neo4j/OAuth integration path. It require
 ```mermaid
 flowchart LR
     user["User / CLI / Browser"]
-    web["web\nSvelteKit dev server"]
+    web["web\nReact + Vite dev server"]
     app["gitexplore\nRust service"]
     neo4j["neo4j\nBolt + Browser"]
     init["neo4j-init\nschema bootstrap"]
@@ -26,7 +26,7 @@ flowchart LR
 1. `neo4j` starts and exposes ports `7474` and `7687`.
 2. `neo4j-init` waits for the database to become healthy and runs the same embedded `gitexplore schema apply` migration command used by production.
 3. `gitexplore` starts with `GITEXPLORE_GRAPH_BACKEND=neo4j`, stores durable identity/session state in Neo4j, and serves HTTP on port `4000`.
-4. `web` installs the frozen pnpm workspace and runs the SvelteKit development server on port `3000`.
+4. `web` installs the frozen pnpm workspace and runs the Vite development server on port `3000`; Vite proxies API paths to the Rust service over the Compose network.
 
 On an existing graph, migration version 1 backfills lowercase user/repository alias keys, disambiguates legacy case-colliding aliases with stable-id placeholders, migrates bookmark target identity from relationships, and then creates the normalized-key, refresh-lease, identity, and owner/target constraints. Migration runners serialize through a database lease, and application startup refuses to serve when the recorded checksum or schema definitions do not match the embedded migration.
 
@@ -46,13 +46,11 @@ For the default local ports, keep:
 GITEXPLORE_GITHUB_REDIRECT_URI=http://localhost:4000/auth/oauth/callback
 GITEXPLORE_GITHUB_SCOPES=read:user
 GITEXPLORE_FRONTEND_ORIGIN=http://localhost:3000
-PUBLIC_GITEXPLORE_API_BASE_URL=http://localhost:4000
-GITEXPLORE_INTERNAL_API_BASE_URL=http://localhost:4000
 ```
 
 The callback URI must also be registered on the GitHub OAuth application. The default OAuth scope is `read:user`, not `repo`; graph expansion uses public GitHub endpoints and imports only public repositories. Generate the identity key with the PowerShell recipe in the root README and keep it only in the ignored `.env` locally and the deployment secret manager in production. The Compose file includes a public development-only fallback so the local stack can boot with an empty value; that fallback is not a production secret. Do not commit a populated `.env`.
 
-`PUBLIC_GITEXPLORE_API_BASE_URL` is embedded for browser requests and therefore uses the host-visible URL. `GITEXPLORE_INTERNAL_API_BASE_URL` is private server runtime configuration for SvelteKit SSR. It falls back to the public URL outside Compose; the Compose `web` service overrides it with `http://gitexplore:4000` so server-side requests use the service network while browsers continue to call `http://localhost:4000`.
+`GITEXPLORE_DEV_API_BASE_URL` configures only Vite's server-side development proxy. It defaults to `http://127.0.0.1:4000` outside Compose; the Compose `web` service sets it to `http://gitexplore:4000`. Browser code always targets the page origin, so the development proxy and production service routes preserve one credentialed origin without exposing an API host to the bundle.
 
 `GITEXPLORE_DATA_DIR` selects the local file-backend state directory; Compose retains `/var/lib/gitexplore` so a legacy identity can be explicitly migrated. Identity and file-backed graph JSON updates are written through a same-directory temporary file that is flushed and fsynced before replacing the destination. GitHub tokens and pending browser nonces are authenticated-encrypted before a new JSON representation is persisted.
 
@@ -79,7 +77,7 @@ http://localhost:4000/health
 http://localhost:7474
 ```
 
-After browser OAuth, use `http://localhost:3000/app/explore` for the GraphQL explorer. OAuth start creates opaque, one-time server-side state with a 10-minute lifetime and binds it to an `HttpOnly`, `SameSite=Lax` nonce cookie scoped to `/auth/oauth`. Pending state is durable in Neo4j, capped at 256 entries with oldest-first eviction, and consumable by any service replica. The callback validates and consumes both values, clears the nonce, and sets `gitexplore_session`. Both cookies add `Secure` when the configured frontend origin uses HTTPS. Private REST and GraphQL requests rely on the session cookie and ignore client-selected user identifiers. Authenticated `GET /auth/status` exposes the canonical, server-derived `app_user_id` for trusted operator crawl dispatch; the unauthenticated value is `null`, and no browser endpoint accepts it as an identity selector.
+After browser OAuth, use `http://localhost:3000/app/explore` for the GraphQL explorer. Explore, Saved, and Settings are the three primary application areas; the former bookmarks, categories, snapshots, and sync URLs redirect into the appropriate area. OAuth start creates opaque, one-time server-side state with a 10-minute lifetime and binds it to an `HttpOnly`, `SameSite=Lax` nonce cookie scoped to `/auth/oauth`. Pending state is durable in Neo4j, capped at 256 entries with oldest-first eviction, and consumable by any service replica. The callback validates and consumes both values, clears the nonce, and sets `gitexplore_session`. Both cookies add `Secure` when the configured frontend origin uses HTTPS. Private REST and GraphQL requests rely on the session cookie and ignore client-selected user identifiers. Authenticated `GET /auth/status` exposes the canonical, server-derived `app_user_id` for trusted operator crawl dispatch; the unauthenticated value is `null`, and no browser endpoint accepts it as an identity selector.
 
 The session cookie and its durable Neo4j record expire after 30 days. Neo4j stores a keyed digest rather than the cookie value. Expired records are purged during session creation/resolution, and the store is bounded to 4,096 active sessions. `POST /auth/logout` removes the current server mapping and returns an expired session cookie. Browser sign-out does not disconnect the GitHub credential. A credential disconnect removes encrypted credential properties but retains the stable account link so reconnecting the same GitHub account recovers its private overlay.
 
@@ -142,18 +140,22 @@ The observed `core` status and the fenced budget lease are durable in the identi
 
 The operator crawler may request a higher floor with `--request-reserve`; values below 1,000 are rejected. That selected floor is enforced by the same live, durable preflight immediately before every expansion, so a stale crawler-side status snapshot cannot admit work across the requested reserve.
 
+The authenticated GraphQL discovery warmup applies the fixed 1,000 floor to a durable per-app-user breadth-first job. `startDiscoveryWarmup` is idempotent and seeds from the connected GitHub login; `discoveryWarmup` returns private progress without accepting a user id. The worker expands one public user per batch, yields for 25 milliseconds, then reacquires the private `discovery-warmup:<app-user-id>` lease for the next batch. Each public expansion separately uses the existing `github-user:<login>` lease and 13-request budget preflight. `RESERVE_PROTECTED` can therefore report an actual remainder from 1,000 through 1,012 when another worst-case expansion cannot be admitted without crossing the floor. It does not busy-loop: status reads and startup recovery leave it stopped, while an explicit start after its recorded reset atomically requeues the same job id and preserves the frontier.
+
+Warmup state is stored on `SyncState`, while imported users, repositories, and relationships remain shared cache facts. The durable state keeps the current entry in the frontier until its graph import succeeds. Startup and recovery read `QUEUED` or `RUNNING` jobs through limited scans; a local four-worker scheduler refills slots as one-user batches finish instead of spawning one task per stored job. After a crash, an uncommitted entry is safely retried once the prior fenced lease expires. Expanded and pending logins share a 10,000-user total bound, deliberately below the 190,000-node production import boundary. The API exposes `frontierTruncated` when additional candidates were dropped, and the retained frontier can still exhaust normally.
+
 At the floor, cached graph reads, stale insight reads, and private saves remain available. A stale insight is returned while its rejected background refresh records an error. A cold fetch or explicit expansion fails with `RATE_BUDGET_RESERVED`, including `remaining`, `reserve`, `requestedCost`/`requested_cost`, and `resetAt`/`reset_at`; compatibility `POST /sync/run` returns HTTP 429. Retry after the returned reset time. The gate protects GitExplore's own refreshes, while GitHub's shared per-user budget can also be consumed by other OAuth apps or tokens.
 
 Neo4j imports have a second, independent capacity boundary. Production config sets `GITEXPLORE_NEO4J_MAX_TOTAL_NODES=190000` and `GITEXPLORE_NEO4J_MAX_TOTAL_RELATIONSHIPS=380000`, leaving headroom below Aura Free's provider ceilings. The import transaction serializes graph-import capacity checks, counts every existing database node and relationship, and rejects a projected import before graph mutation when either limit would be crossed. The projection is intentionally conservative: it adds up to every distinct incoming user, repository, and directed relationship without subtracting data already stored or relationships an authoritative import may replace. A rejection reports the existing, up-to-incoming, projected, and configured maximum counts and explicitly rolls back the transaction. Identity, bookmark, session, and other ancillary creation paths consume the reserved provider headroom but are not globally serialized by this import mutex, so provider capacity still requires monitoring. The crawler's own discovery counters are progress controls; the transactional import boundary is authoritative for graph imports.
 
 ## HTTP surfaces
 
-- `POST /graphql`: cookie-authenticated neighborhood, expansion, and save operations
+- `POST /graphql`: cookie-authenticated neighborhood, expansion, discovery-warmup, and save operations
 - `/auth/*`: browser OAuth, connection status, and server-backed browser logout
 - `/sync/*`, `/bookmarks`, `/categories`, `/explore*`: compatibility REST routes
 - `GET /health`: unauthenticated health check
 
-The configured frontend origin is the only credentialed CORS origin when it parses successfully. The typed browser client sends `credentials: "include"`. SvelteKit uses the internal API base URL for server-side fetches and forwards the session cookie only when the request target exactly matches that configured internal API origin.
+The configured frontend origin is the only credentialed CORS origin when it parses successfully. The typed browser client targets that same origin with `credentials: "include"`. Vite proxies API paths in local development; production routes them to the API service on the same origin.
 
 ## Verification boundary
 
@@ -172,6 +174,6 @@ Those checks validate in-process behavior and types. The ignored `live_neo4j_ref
 2. populated GitHub OAuth credentials
 3. the callback URI registered at GitHub
 4. a browser OAuth round trip
-5. expansion of at least one user at `/app/explore/[login]`
+5. expansion of at least one user at `/app/explore/:login`
 
 The migration apply/check commands and fenced refresh lease were exercised against the local Neo4j Compose database. The migration was also applied and checked successfully against Aura from the Linux production image. On Windows, use the containerized Aura schema workflow in [Production deployment](deployment.md#windows-operator-path-for-aura-schema-commands) so the command uses the image's public CA bundle without weakening TLS. The deployed browser OAuth round trip remains an operator verification step.

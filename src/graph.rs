@@ -127,6 +127,64 @@ pub enum RefreshJobStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryWarmupStatus {
+    Queued,
+    Running,
+    Completed,
+    ReserveProtected,
+    Failed,
+}
+
+impl DiscoveryWarmupStatus {
+    pub fn is_runnable(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::ReserveProtected => "reserve_protected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryWarmupJob {
+    pub id: String,
+    pub seed_login: String,
+    pub status: DiscoveryWarmupStatus,
+    pub current_login: Option<String>,
+    pub expanded_logins: Vec<String>,
+    pub frontier: Vec<String>,
+    pub frontier_truncated: bool,
+    pub remaining_requests: Option<usize>,
+    pub reserve_requests: usize,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+impl DiscoveryWarmupJob {
+    pub fn expanded_users(&self) -> usize {
+        self.expanded_logins.len()
+    }
+
+    pub fn pending_users(&self) -> usize {
+        self.frontier.len()
+    }
+
+    pub fn discovered_users(&self) -> usize {
+        self.expanded_users().saturating_add(self.pending_users())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncState {
     NeverSynced,

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, Weak},
     time::Duration as StdDuration,
@@ -10,6 +10,7 @@ use chrono::{Duration, Utc};
 use secrecy::ExposeSecret;
 use tokio::{
     sync::{Mutex as AsyncMutex, watch},
+    task::JoinSet,
     time::{self, Instant},
 };
 use uuid::Uuid;
@@ -19,8 +20,9 @@ use crate::{
     discovery::{RepositoryCandidate, UserNeighborhood},
     exploration::{ExplorationResult, ExplorationSeed, ExplorationSnapshot},
     graph::{
-        GitHubRateLimitLease, GitHubRateLimitStatus, RefreshLease, RefreshLeaseAttempt,
-        RefreshLeaseStatus, SyncState, SyncStatus, SyncSummary, UserRefreshOutcome,
+        CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus, GitHubRateLimitLease,
+        GitHubRateLimitStatus, RefreshLease, RefreshLeaseAttempt, RefreshLeaseStatus, SyncState,
+        SyncStatus, SyncSummary, UserRefreshOutcome,
     },
     identity::{
         AuthSessionResult, CompletedBrowserLogin, ConnectionStatus, GitHubConnection,
@@ -101,10 +103,12 @@ impl AppServices {
         let discovery = Arc::new(DefaultDiscoveryService {
             identity_repo: identity_repo.clone(),
             import_repo: import_repo.clone(),
+            sync_state_repo,
             discovery_repo,
             github: github.clone(),
             refreshes,
             rate_budgets: rate_budgets.clone(),
+            warmup_scheduler: DiscoveryWarmupScheduler::default(),
         });
         let insights = Arc::new(DefaultInsightService {
             identity_repo,
@@ -298,6 +302,11 @@ pub const GITHUB_CORE_REST_RESERVE: usize = GITHUB_CORE_REST_MINIMUM_RESERVE;
 const GITHUB_GRAPH_EXPANSION_MAX_REQUESTS: usize = 13;
 const GITHUB_REPOSITORY_CONTRIBUTORS_MAX_REQUESTS: usize = 1;
 const GITHUB_USER_EVENTS_MAX_REQUESTS: usize = 3;
+const DISCOVERY_WARMUP_TOTAL_USER_LIMIT: usize = 10_000;
+const DISCOVERY_WARMUP_LOCAL_WORKER_LIMIT: usize = 4;
+const DISCOVERY_WARMUP_RUNNABLE_SCAN_LIMIT: usize = 32;
+const DISCOVERY_WARMUP_BATCH_PAUSE_MILLISECONDS: u64 = 25;
+const DISCOVERY_WARMUP_PEER_DEFER_MILLISECONDS: u64 = 1_000;
 const RATE_BUDGET_LEASE_SECONDS: i64 = 120;
 const RATE_BUDGET_HEARTBEAT_SECONDS: u64 = 30;
 const RATE_BUDGET_WAIT_SECONDS: u64 = 300;
@@ -785,13 +794,29 @@ impl ExplorationService for DefaultExplorationService {
     }
 }
 
+#[derive(Clone)]
 pub struct DefaultDiscoveryService {
     identity_repo: Arc<dyn IdentityRepository>,
     import_repo: Arc<dyn GitHubImportRepository>,
+    sync_state_repo: Arc<dyn SyncStateRepository>,
     discovery_repo: Arc<dyn DiscoveryRepository>,
     github: Arc<dyn GitHubClientPort>,
     refreshes: RefreshCoordinator,
     rate_budgets: GitHubRateBudgetCoordinator,
+    warmup_scheduler: DiscoveryWarmupScheduler,
+}
+
+#[derive(Clone, Default)]
+struct DiscoveryWarmupScheduler {
+    state: Arc<AsyncMutex<DiscoveryWarmupSchedulerState>>,
+}
+
+#[derive(Default)]
+struct DiscoveryWarmupSchedulerState {
+    running: bool,
+    generation: u64,
+    active_user_ids: HashSet<String>,
+    deferred_until: HashMap<String, Instant>,
 }
 
 #[async_trait]
@@ -936,6 +961,469 @@ impl DiscoveryService for DefaultDiscoveryService {
         refresh_guard.finish(&shared_result).await;
         result.map(|(_, neighborhood)| neighborhood)
     }
+
+    async fn start_warmup(&self, user_id: &str) -> AppResult<DiscoveryWarmupJob> {
+        let connection = self.github_connection(user_id).await?;
+        let seed_login = normalize_github_login(&connection.account.login)?;
+        let now = Utc::now();
+        if let Some(existing) = self.sync_state_repo.discovery_warmup(user_id).await?
+            && existing.status == DiscoveryWarmupStatus::ReserveProtected
+            && existing.reset_at.is_some_and(|reset_at| reset_at <= now)
+        {
+            let mut resumed = existing;
+            resumed.status = DiscoveryWarmupStatus::Queued;
+            resumed.current_login = None;
+            resumed.remaining_requests = None;
+            resumed.reset_at = None;
+            resumed.updated_at = now;
+            resumed.completed_at = None;
+            resumed.last_error = None;
+            let warmup = self
+                .sync_state_repo
+                .resume_discovery_warmup_after_reset(user_id, resumed)
+                .await?;
+            if warmup.status.is_runnable() {
+                self.kick_warmup_scheduler().await;
+            }
+            return Ok(warmup);
+        }
+        let warmup = self
+            .sync_state_repo
+            .start_discovery_warmup(
+                user_id,
+                DiscoveryWarmupJob {
+                    id: Uuid::new_v4().to_string(),
+                    seed_login: seed_login.clone(),
+                    status: DiscoveryWarmupStatus::Queued,
+                    current_login: None,
+                    expanded_logins: Vec::new(),
+                    frontier: vec![seed_login],
+                    frontier_truncated: false,
+                    remaining_requests: None,
+                    reserve_requests: GITHUB_CORE_REST_RESERVE,
+                    reset_at: None,
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                    last_error: None,
+                },
+            )
+            .await?;
+        if warmup.status.is_runnable() {
+            self.kick_warmup_scheduler().await;
+        }
+        Ok(warmup)
+    }
+
+    async fn warmup_status(&self, user_id: &str) -> AppResult<Option<DiscoveryWarmupJob>> {
+        let warmup = self.sync_state_repo.discovery_warmup(user_id).await?;
+        if warmup
+            .as_ref()
+            .is_some_and(|warmup| warmup.status.is_runnable())
+        {
+            self.kick_warmup_scheduler().await;
+        }
+        Ok(warmup)
+    }
+
+    async fn resume_warmups(&self) -> AppResult<()> {
+        self.kick_warmup_scheduler().await;
+        Ok(())
+    }
+}
+
+enum DiscoveryWarmupBatchResult {
+    Continue,
+    Stop,
+    PeerActive,
+}
+
+impl DefaultDiscoveryService {
+    async fn github_connection(&self, user_id: &str) -> AppResult<GitHubConnection> {
+        self.identity_repo
+            .get_connection(user_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Validation("user is not authenticated with GitHub".to_string())
+            })
+    }
+
+    async fn kick_warmup_scheduler(&self) {
+        let should_spawn = {
+            let mut scheduler = self.warmup_scheduler.state.lock().await;
+            scheduler.generation = scheduler.generation.wrapping_add(1);
+            if scheduler.running {
+                false
+            } else {
+                scheduler.running = true;
+                true
+            }
+        };
+        if should_spawn {
+            let service = self.clone();
+            tokio::spawn(async move {
+                service.run_warmup_scheduler().await;
+            });
+        }
+    }
+
+    async fn run_warmup_scheduler(&self) {
+        let mut workers = JoinSet::new();
+        loop {
+            let scan_generation = self.warmup_scheduler.state.lock().await.generation;
+            if workers.len() < DISCOVERY_WARMUP_LOCAL_WORKER_LIMIT {
+                match self
+                    .sync_state_repo
+                    .runnable_discovery_warmups(DISCOVERY_WARMUP_RUNNABLE_SCAN_LIMIT)
+                    .await
+                {
+                    Ok(candidates) => {
+                        let mut scheduler = self.warmup_scheduler.state.lock().await;
+                        let now = Instant::now();
+                        scheduler
+                            .deferred_until
+                            .retain(|_, retry_at| *retry_at > now);
+                        let available = DISCOVERY_WARMUP_LOCAL_WORKER_LIMIT
+                            .saturating_sub(scheduler.active_user_ids.len());
+                        let to_schedule = candidates
+                            .into_iter()
+                            .filter(|user_id| {
+                                !scheduler.active_user_ids.contains(user_id)
+                                    && !scheduler.deferred_until.contains_key(user_id)
+                            })
+                            .take(available)
+                            .collect::<Vec<_>>();
+                        for user_id in to_schedule {
+                            scheduler.active_user_ids.insert(user_id.clone());
+                            let service = self.clone();
+                            workers.spawn(async move {
+                                let result = service.run_warmup_batch(&user_id).await;
+                                (user_id, result)
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not scan runnable discovery warmups");
+                        if workers.is_empty() {
+                            self.warmup_scheduler.state.lock().await.running = false;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if workers.is_empty() {
+                let retry_at = {
+                    let mut scheduler = self.warmup_scheduler.state.lock().await;
+                    if scheduler.generation != scan_generation {
+                        continue;
+                    }
+                    let retry_at = scheduler.deferred_until.values().copied().min();
+                    if retry_at.is_none() {
+                        scheduler.running = false;
+                    }
+                    retry_at
+                };
+                if let Some(retry_at) = retry_at {
+                    time::sleep_until(retry_at).await;
+                    continue;
+                }
+                return;
+            }
+
+            match workers.join_next().await {
+                Some(Ok((user_id, result))) => {
+                    let peer_active = matches!(result, Ok(DiscoveryWarmupBatchResult::PeerActive));
+                    let mut scheduler = self.warmup_scheduler.state.lock().await;
+                    scheduler.active_user_ids.remove(&user_id);
+                    if peer_active {
+                        scheduler.deferred_until.insert(
+                            user_id.clone(),
+                            Instant::now()
+                                + StdDuration::from_millis(
+                                    DISCOVERY_WARMUP_PEER_DEFER_MILLISECONDS,
+                                ),
+                        );
+                    }
+                    drop(scheduler);
+                    if let Err(error) = result {
+                        tracing::warn!(app_user_id = %user_id, %error, "discovery warmup batch failed");
+                    }
+                }
+                Some(Err(error)) => {
+                    tracing::error!(%error, "discovery warmup worker task failed");
+                    workers.abort_all();
+                    while workers.join_next().await.is_some() {}
+                    self.warmup_scheduler
+                        .state
+                        .lock()
+                        .await
+                        .active_user_ids
+                        .clear();
+                }
+                None => {}
+            }
+            time::sleep(StdDuration::from_millis(
+                DISCOVERY_WARMUP_BATCH_PAUSE_MILLISECONDS,
+            ))
+            .await;
+        }
+    }
+
+    async fn run_warmup_batch(&self, user_id: &str) -> AppResult<DiscoveryWarmupBatchResult> {
+        let Some(warmup) = self.sync_state_repo.discovery_warmup(user_id).await? else {
+            return Ok(DiscoveryWarmupBatchResult::Stop);
+        };
+        if !warmup.status.is_runnable() {
+            return Ok(DiscoveryWarmupBatchResult::Stop);
+        }
+
+        let entity_key = warmup_refresh_key(user_id);
+        let lease = match enter_durable_refresh(&self.import_repo, &entity_key).await? {
+            DurableRefreshRole::Leader(lease) => lease,
+            DurableRefreshRole::Completed(_) => {
+                return Ok(DiscoveryWarmupBatchResult::PeerActive);
+            }
+        };
+        let mut guard = DurableRefreshGuard::new(self.import_repo.clone(), lease);
+        let Some(mut warmup) = self.sync_state_repo.discovery_warmup(user_id).await? else {
+            self.complete_warmup_lease(&mut guard).await?;
+            return Ok(DiscoveryWarmupBatchResult::Stop);
+        };
+        if !warmup.status.is_runnable() {
+            self.complete_warmup_lease(&mut guard).await?;
+            return Ok(DiscoveryWarmupBatchResult::Stop);
+        }
+
+        remove_expanded_frontier_entries(&mut warmup);
+        let Some(login) = warmup.frontier.first().cloned() else {
+            let now = Utc::now();
+            warmup.status = DiscoveryWarmupStatus::Completed;
+            warmup.current_login = None;
+            warmup.updated_at = now;
+            warmup.completed_at = Some(now);
+            self.save_warmup(user_id, warmup, guard.lease()).await?;
+            self.complete_warmup_lease(&mut guard).await?;
+            return Ok(DiscoveryWarmupBatchResult::Stop);
+        };
+
+        let connection = match self.github_connection(user_id).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let now = Utc::now();
+                warmup.status = DiscoveryWarmupStatus::Failed;
+                warmup.current_login = None;
+                warmup.updated_at = now;
+                warmup.completed_at = Some(now);
+                warmup.last_error = Some(truncate_warmup_error(&error));
+                let save_result = self.save_warmup(user_id, warmup, guard.lease()).await;
+                guard.fail(&error).await;
+                save_result?;
+                return Err(error);
+            }
+        };
+
+        warmup.status = DiscoveryWarmupStatus::Running;
+        warmup.current_login = Some(login.clone());
+        warmup.updated_at = Utc::now();
+        warmup.completed_at = None;
+        warmup.last_error = None;
+        self.save_warmup(user_id, warmup.clone(), guard.lease())
+            .await?;
+
+        let neighborhood_result = match self.discovery_repo.user_neighborhood(user_id, &login).await
+        {
+            Ok(neighborhood)
+                if neighborhood.user.neighborhood_cache_status == CacheStatus::Fresh
+                    && neighborhood.coverage.is_complete() =>
+            {
+                Ok((neighborhood, false))
+            }
+            Ok(_) | Err(AppError::NotFound(_)) => fetch_with_refresh_heartbeat(
+                self.import_repo.clone(),
+                guard.lease(),
+                self.expand_user_with_reserve(user_id, &login, GITHUB_CORE_REST_RESERVE),
+            )
+            .await
+            .map(|neighborhood| (neighborhood, true)),
+            Err(error) => Err(error),
+        };
+
+        match neighborhood_result {
+            Ok((neighborhood, refreshed)) => {
+                advance_warmup_frontier(&mut warmup, &login, &neighborhood);
+                let remaining_after_refresh = if refreshed {
+                    match self
+                        .identity_repo
+                        .github_rate_limit(connection.account.github_user_id)
+                        .await
+                    {
+                        Ok(Some(status)) => {
+                            warmup.remaining_requests = Some(status.remaining);
+                            warmup.reset_at = Some(status.reset_at);
+                            Some(status.remaining)
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            tracing::warn!(app_user_id = %user_id, %error, "could not read warmup rate-limit progress");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let now = Utc::now();
+                warmup.current_login = None;
+                warmup.updated_at = now;
+                let result = if remaining_after_refresh
+                    .is_some_and(|remaining| remaining <= warmup.reserve_requests)
+                {
+                    warmup.status = DiscoveryWarmupStatus::ReserveProtected;
+                    warmup.completed_at = Some(now);
+                    DiscoveryWarmupBatchResult::Stop
+                } else if warmup.frontier.is_empty() {
+                    warmup.status = DiscoveryWarmupStatus::Completed;
+                    warmup.completed_at = Some(now);
+                    DiscoveryWarmupBatchResult::Stop
+                } else {
+                    warmup.status = DiscoveryWarmupStatus::Queued;
+                    warmup.completed_at = None;
+                    DiscoveryWarmupBatchResult::Continue
+                };
+                self.save_warmup(user_id, warmup, guard.lease()).await?;
+                self.complete_warmup_lease(&mut guard).await?;
+                Ok(result)
+            }
+            Err(
+                error @ AppError::RateBudgetReserved {
+                    remaining,
+                    reset_at,
+                    ..
+                },
+            ) => {
+                let now = Utc::now();
+                warmup.status = DiscoveryWarmupStatus::ReserveProtected;
+                warmup.current_login = None;
+                warmup.remaining_requests = Some(remaining);
+                warmup.reset_at = Some(reset_at);
+                warmup.updated_at = now;
+                warmup.completed_at = Some(now);
+                warmup.last_error = None;
+                self.save_warmup(user_id, warmup, guard.lease()).await?;
+                self.complete_warmup_lease(&mut guard).await?;
+                tracing::info!(app_user_id = %user_id, %error, "discovery warmup preserved the GitHub REST reserve");
+                Ok(DiscoveryWarmupBatchResult::Stop)
+            }
+            Err(error) => {
+                let now = Utc::now();
+                warmup.status = DiscoveryWarmupStatus::Failed;
+                warmup.current_login = None;
+                warmup.updated_at = now;
+                warmup.completed_at = Some(now);
+                warmup.last_error = Some(truncate_warmup_error(&error));
+                let save_result = self.save_warmup(user_id, warmup, guard.lease()).await;
+                guard.fail(&error).await;
+                save_result?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn save_warmup(
+        &self,
+        user_id: &str,
+        warmup: DiscoveryWarmupJob,
+        lease: &RefreshLease,
+    ) -> AppResult<()> {
+        if !self
+            .sync_state_repo
+            .save_discovery_warmup_under_lease(user_id, warmup, lease)
+            .await?
+        {
+            return Err(AppError::External(
+                "discovery warmup lease was lost before progress could be saved".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn complete_warmup_lease(&self, guard: &mut DurableRefreshGuard) -> AppResult<()> {
+        if !self
+            .import_repo
+            .complete_refresh_lease(guard.lease(), None)
+            .await?
+        {
+            return Err(AppError::External(
+                "discovery warmup lease was lost before batch completion".to_string(),
+            ));
+        }
+        guard.disarm();
+        Ok(())
+    }
+}
+
+fn warmup_refresh_key(user_id: &str) -> String {
+    format!("discovery-warmup:{user_id}")
+}
+
+fn remove_expanded_frontier_entries(warmup: &mut DiscoveryWarmupJob) {
+    let expanded = warmup
+        .expanded_logins
+        .iter()
+        .map(|login| login.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    warmup
+        .frontier
+        .retain(|login| !expanded.contains(&login.to_ascii_lowercase()));
+}
+
+fn advance_warmup_frontier(
+    warmup: &mut DiscoveryWarmupJob,
+    requested_login: &str,
+    neighborhood: &UserNeighborhood,
+) {
+    let requested_login = requested_login.to_ascii_lowercase();
+    let canonical_login = neighborhood.user.profile.login.to_ascii_lowercase();
+    warmup.frontier.retain(|login| {
+        let login = login.to_ascii_lowercase();
+        login != requested_login && login != canonical_login
+    });
+    if !warmup
+        .expanded_logins
+        .iter()
+        .any(|login| login.eq_ignore_ascii_case(&canonical_login))
+    {
+        warmup.expanded_logins.push(canonical_login.clone());
+    }
+
+    let mut known = warmup
+        .expanded_logins
+        .iter()
+        .chain(warmup.frontier.iter())
+        .map(|login| login.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for candidate in neighborhood
+        .following
+        .iter()
+        .chain(neighborhood.followers.iter())
+    {
+        let Ok(login) = normalize_github_login(&candidate.profile.login) else {
+            continue;
+        };
+        if known.contains(&login) {
+            continue;
+        }
+        if known.len() >= DISCOVERY_WARMUP_TOTAL_USER_LIMIT {
+            warmup.frontier_truncated = true;
+            continue;
+        }
+        known.insert(login.clone());
+        warmup.frontier.push(login);
+    }
+}
+
+fn truncate_warmup_error(error: &AppError) -> String {
+    error.to_string().chars().take(1_000).collect()
 }
 
 pub struct DefaultInsightService {
@@ -1706,8 +2194,17 @@ impl Drop for DurableRefreshGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_github_login;
-    use crate::shared::AppError;
+    use super::{
+        DISCOVERY_WARMUP_TOTAL_USER_LIMIT, advance_warmup_frontier, normalize_github_login,
+    };
+    use crate::{
+        discovery::{DiscoveryUser, UserNeighborhood},
+        graph::{
+            CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus, GitHubUserNode,
+            GraphImportCoverage,
+        },
+        shared::AppError,
+    };
 
     #[test]
     fn github_login_validation_rejects_path_and_query_delimiters() {
@@ -1739,5 +2236,60 @@ mod tests {
             normalize_github_login(" Octo-Cat1 ").expect("valid GitHub login"),
             "octo-cat1"
         );
+    }
+
+    #[test]
+    fn discovery_warmup_total_bound_truncates_and_exhausts_the_frontier() {
+        let now = chrono::Utc::now();
+        let mut warmup = DiscoveryWarmupJob {
+            id: "bounded-warmup".to_string(),
+            seed_login: "seed-0".to_string(),
+            status: DiscoveryWarmupStatus::Running,
+            current_login: Some("current".to_string()),
+            expanded_logins: (0..DISCOVERY_WARMUP_TOTAL_USER_LIMIT - 1)
+                .map(|index| format!("seed-{index}"))
+                .collect(),
+            frontier: vec!["current".to_string()],
+            frontier_truncated: false,
+            remaining_requests: None,
+            reserve_requests: 1_000,
+            reset_at: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            last_error: None,
+        };
+        let neighborhood = UserNeighborhood {
+            user: DiscoveryUser {
+                profile: GitHubUserNode {
+                    github_id: 1,
+                    login: "current".to_string(),
+                    url: "https://github.com/current".to_string(),
+                    ..Default::default()
+                },
+                neighborhood_cache_status: CacheStatus::Fresh,
+                neighborhood_last_fetched_at: Some(now),
+            },
+            followers: Vec::new(),
+            following: vec![DiscoveryUser {
+                profile: GitHubUserNode {
+                    github_id: 2,
+                    login: "overflow".to_string(),
+                    url: "https://github.com/overflow".to_string(),
+                    ..Default::default()
+                },
+                neighborhood_cache_status: CacheStatus::Stale,
+                neighborhood_last_fetched_at: None,
+            }],
+            starred_repositories: Vec::new(),
+            owned_repositories: Vec::new(),
+            coverage: GraphImportCoverage::default(),
+        };
+
+        advance_warmup_frontier(&mut warmup, "current", &neighborhood);
+
+        assert_eq!(warmup.discovered_users(), DISCOVERY_WARMUP_TOTAL_USER_LIMIT);
+        assert!(warmup.frontier.is_empty());
+        assert!(warmup.frontier_truncated);
     }
 }

@@ -48,6 +48,20 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Restore Playwright Chromium cache
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-${{ runner.arch }}-playwright-1.61.1-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install Chromium operating-system dependencies
+        run: pnpm exec playwright install-deps chromium
+
+      - name: Install pinned Chromium browser
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install chromium
+
       - name: Verify Rust service
         run: |
           cargo fmt --check
@@ -158,7 +172,8 @@ jobs:
             https://gitexplore.moriatz.com/graphql)"
           jq -e '.data.apiVersion | type == "string" and length > 0' <<<"$graphql" >/dev/null
           landing="$(curl --fail --silent --show-error --max-time 15 https://gitexplore.moriatz.com/login)"
-          grep -q 'https://gitexplore.moriatz.com' <<<"$landing"
+          grep -q '<div id="root"></div>' <<<"$landing"
+          grep -q '<title>GitExplore</title>' <<<"$landing"
           if grep -q 'http://localhost:4000' <<<"$landing"; then
             echo 'Production page contains the local API fallback' >&2
             exit 1
@@ -168,6 +183,13 @@ jobs:
           grep -qi '^strict-transport-security: max-age=31536000' <<<"$headers"
           grep -qi '^x-content-type-options: nosniff' <<<"$headers"
           grep -qi '^x-frame-options: DENY' <<<"$headers"
+          grep -qi "^content-security-policy: .*default-src 'self'.*frame-ancestors 'none'.*object-src 'none'.*script-src 'self'" <<<"$headers"
+
+          auth_headers="$(curl --fail --silent --show-error --dump-header - --output /dev/null --max-time 15 https://gitexplore.moriatz.com/auth/status)"
+          grep -qi '^cache-control: private, no-store' <<<"$auth_headers"
+
+      - name: Boot canonical React frontend in Chromium
+        run: pnpm production:smoke -- https://gitexplore.moriatz.com
 
       - name: Publish deployment metadata
         shell: bash

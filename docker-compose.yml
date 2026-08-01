@@ -77,8 +77,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      PUBLIC_GITEXPLORE_API_BASE_URL: "${PUBLIC_GITEXPLORE_API_BASE_URL:-http://localhost:4000}"
-      GITEXPLORE_INTERNAL_API_BASE_URL: "http://gitexplore:4000"
+      GITEXPLORE_DEV_API_BASE_URL: "http://gitexplore:4000"
     command:
       - /bin/sh
       - -lc

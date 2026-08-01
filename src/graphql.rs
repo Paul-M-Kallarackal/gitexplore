@@ -10,8 +10,8 @@ use crate::{
     bootstrap::AppState,
     discovery::{DiscoveryRepositoryRecord, DiscoveryUser, RepositoryCandidate, UserNeighborhood},
     graph::{
-        CacheStatus, GitHubRateLimitStatus, GitHubRepositoryNode, GitHubUserNode,
-        GraphImportCoverage,
+        CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus, GitHubRateLimitStatus,
+        GitHubRepositoryNode, GitHubUserNode, GraphImportCoverage,
     },
     insights::{
         REPOSITORY_CONTRIBUTOR_SOURCE, RepositoryContributor, RepositoryContributorInsights,
@@ -86,6 +86,22 @@ impl QueryRoot {
             .map_err(graphql_error)
     }
 
+    #[graphql(complexity = 2)]
+    async fn discovery_warmup(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<Option<DiscoveryWarmupObject>> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .discovery
+            .warmup_status(user_id)
+            .await
+            .map(|warmup| warmup.map(DiscoveryWarmupObject::from))
+            .map_err(graphql_error)
+    }
+
     #[graphql(complexity = 12)]
     async fn repository_insights(
         &self,
@@ -129,6 +145,22 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    #[graphql(complexity = 2)]
+    async fn start_discovery_warmup(
+        &self,
+        context: &Context<'_>,
+    ) -> GraphQlResult<DiscoveryWarmupObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .discovery
+            .start_warmup(user_id)
+            .await
+            .map(DiscoveryWarmupObject::from)
+            .map_err(graphql_error)
+    }
+
     #[graphql(complexity = 60)]
     async fn expand_user(
         &self,
@@ -221,6 +253,73 @@ impl From<GitHubRateLimitStatus> for GitHubRateLimitObject {
             remaining: saturating_i32(value.remaining as u64),
             reset_at: value.reset_at.to_rfc3339(),
             checked_at: value.checked_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+pub enum DiscoveryWarmupStatusObject {
+    Queued,
+    Running,
+    Completed,
+    ReserveProtected,
+    Failed,
+}
+
+impl From<DiscoveryWarmupStatus> for DiscoveryWarmupStatusObject {
+    fn from(value: DiscoveryWarmupStatus) -> Self {
+        match value {
+            DiscoveryWarmupStatus::Queued => Self::Queued,
+            DiscoveryWarmupStatus::Running => Self::Running,
+            DiscoveryWarmupStatus::Completed => Self::Completed,
+            DiscoveryWarmupStatus::ReserveProtected => Self::ReserveProtected,
+            DiscoveryWarmupStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct DiscoveryWarmupObject {
+    pub id: String,
+    pub seed_login: String,
+    pub status: DiscoveryWarmupStatusObject,
+    pub current_login: Option<String>,
+    pub expanded_users: i32,
+    pub discovered_users: i32,
+    pub pending_users: i32,
+    pub frontier_truncated: bool,
+    pub remaining_requests: Option<i32>,
+    pub reserve_requests: i32,
+    pub reset_at: Option<String>,
+    pub started_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl From<DiscoveryWarmupJob> for DiscoveryWarmupObject {
+    fn from(value: DiscoveryWarmupJob) -> Self {
+        let expanded_users = saturating_i32(value.expanded_users() as u64);
+        let discovered_users = saturating_i32(value.discovered_users() as u64);
+        let pending_users = saturating_i32(value.pending_users() as u64);
+        Self {
+            id: value.id,
+            seed_login: value.seed_login,
+            status: value.status.into(),
+            current_login: value.current_login,
+            expanded_users,
+            discovered_users,
+            pending_users,
+            frontier_truncated: value.frontier_truncated,
+            remaining_requests: value
+                .remaining_requests
+                .map(|remaining| saturating_i32(remaining as u64)),
+            reserve_requests: saturating_i32(value.reserve_requests as u64),
+            reset_at: value.reset_at.map(|timestamp| timestamp.to_rfc3339()),
+            started_at: value.started_at.to_rfc3339(),
+            updated_at: value.updated_at.to_rfc3339(),
+            completed_at: value.completed_at.map(|timestamp| timestamp.to_rfc3339()),
+            last_error: value.last_error,
         }
     }
 }
@@ -700,6 +799,9 @@ mod tests {
         assert!(sdl.contains("saveRepository("));
         assert!(sdl.contains("type UserNeighborhoodObject"));
         assert!(sdl.contains("rateLimit: GitHubRateLimitObject!"));
+        assert!(sdl.contains("discoveryWarmup: DiscoveryWarmupObject"));
+        assert!(sdl.contains("startDiscoveryWarmup: DiscoveryWarmupObject!"));
+        assert!(sdl.contains("enum DiscoveryWarmupStatusObject"));
         assert!(sdl.contains("repositoryInsights(fullName: String!, limit: Int!)"));
         assert!(sdl.contains("userInsights(login: String!, limit: Int!)"));
     }
