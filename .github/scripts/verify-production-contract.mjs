@@ -12,7 +12,9 @@ const manifest = json('ribbon.json');
 const workspace = json('package.json');
 const vercel = json('vercel.json');
 const dockerfile = read('Dockerfile.vercel');
+const ci = read('.github/workflows/ci.yml');
 const release = read('.github/workflows/release.yml');
+const releasePreparation = read('.github/scripts/prepare-linux-release.sh');
 const schema = read('docker/neo4j/init/01-schema.cypher').replace(/\r\n/g, '\n');
 
 requireContract(manifest.manifestVersion === 2, 'Ribbon manifestVersion must be 2');
@@ -142,6 +144,46 @@ for (const fragment of [
   requireContract(dockerfile.includes(fragment), `Dockerfile.vercel must contain: ${fragment}`);
 }
 requireContract(!dockerfile.includes('RUN --mount='), 'Production Dockerfile must work without BuildKit-only RUN mounts');
+requireContract(
+  dockerfile.includes('.gitexplore-release/gitexplore') &&
+    dockerfile.includes('.gitexplore-release/source.sha256') &&
+    dockerfile.includes('RUN set -eu;') &&
+    dockerfile.includes('/tmp/gitexplore --help'),
+  'Production Dockerfile must validate the optional CI-built Linux binary'
+);
+requireContract(
+  ci.includes("needs.changes.outputs.source_build == 'true'") &&
+    ci.includes('gitexplore-api:fallback'),
+  'CI must exercise the self-contained production image when its build contract changes'
+);
+requireContract(
+  ci.includes('if [ "$PRODUCTION_API" = "true" ]') &&
+    ci.includes('test "$IMAGE_RESULT" = "skipped"'),
+  'The required CI check must correlate image changes with image job results'
+);
+for (const [workflow, contents] of [
+  ['CI', ci],
+  ['release', release],
+]) {
+  requireContract(
+    contents.includes('runs-on: ubuntu-22.04') &&
+      contents.includes('ubuntu-22.04-${{ runner.arch }}-rust-1.91.0-') &&
+      contents.includes('bash .github/scripts/prepare-linux-release.sh'),
+    `${workflow} must build the production binary on the pinned ABI-compatible runner`
+  );
+}
+for (const fragment of [
+  'set -euo pipefail',
+  'cargo build --locked --release',
+  'install -Dm755 target/release/gitexplore',
+  'docker/neo4j/init',
+  'source.sha256',
+]) {
+  requireContract(
+    releasePreparation.includes(fragment),
+    `Linux release preparation must contain: ${fragment}`
+  );
+}
 
 const requiredServerEnv = [
   'GITEXPLORE_DEPLOYMENT_MODE',
