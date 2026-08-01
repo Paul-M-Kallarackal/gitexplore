@@ -8,7 +8,16 @@ COPY src ./src
 COPY docker/neo4j/init ./docker/neo4j/init
 COPY .gitexplore-release ./.gitexplore-release
 
-RUN if [ -f /workspace/.gitexplore-release/gitexplore ]; then \
+RUN set -eu; \
+    if [ -f /workspace/.gitexplore-release/gitexplore ] \
+        || [ -f /workspace/.gitexplore-release/source.sha256 ]; then \
+        test -f /workspace/.gitexplore-release/gitexplore; \
+        test -f /workspace/.gitexplore-release/source.sha256; \
+        export LC_ALL=C; \
+        expected_source="$(cat /workspace/.gitexplore-release/source.sha256)"; \
+        actual_source="$(find Cargo.toml Cargo.lock rust-toolchain.toml src docker/neo4j/init \
+            -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)"; \
+        test "$actual_source" = "$expected_source"; \
         install -m 0755 /workspace/.gitexplore-release/gitexplore /tmp/gitexplore; \
         /tmp/gitexplore --help >/dev/null; \
     else \

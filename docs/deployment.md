@@ -28,7 +28,9 @@ The protected release workflow builds the Rust release binary once on the pinned
 `ubuntu-22.04` runner, uses that same binary for the Aura schema gate, and hands
 it to `Dockerfile.vercel`. The Docker build executes the binary in both its
 Bookworm build and runtime stages before deployment, so an ABI mismatch fails
-before the artifact can ship. When the handoff file is absent, local
+before the artifact can ship. A deterministic source fingerprint makes a stale
+or partial handoff fail closed instead of packaging unrelated code. When both
+handoff files are absent, local
 `docker build` commands keep using the self-contained Rust builder path.
 
 ## Fail-closed production blockers

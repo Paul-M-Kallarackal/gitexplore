@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       production_api: ${{ steps.filter.outputs.production_api }}
+      source_build: ${{ steps.filter.outputs.source_build }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +28,7 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           if git diff --quiet "$BASE_SHA" HEAD -- \
+            .github/scripts/prepare-linux-release.sh \
             .github/workflows/ci.yml \
             .github/workflows/release.yml \
             .dockerignore \
@@ -40,6 +42,18 @@ jobs:
             echo "production_api=false" >> "$GITHUB_OUTPUT"
           else
             echo "production_api=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$BASE_SHA" HEAD -- \
+            .dockerignore \
+            .gitexplore-release \
+            Dockerfile.vercel \
+            Cargo.toml \
+            Cargo.lock \
+            rust-toolchain.toml; then
+            echo "source_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_build=true" >> "$GITHUB_OUTPUT"
           fi
 
   quality:
@@ -120,15 +134,20 @@ jobs:
         run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
 
       - name: Build verified Linux release binary
-        run: |
-          cargo build --locked --release
-          install -Dm755 target/release/gitexplore .gitexplore-release/gitexplore
+        run: bash .github/scripts/prepare-linux-release.sh
 
       - name: Verify production API image
         run: docker build --file Dockerfile.vercel --tag gitexplore-api:verify .
 
       - name: Boot production API image
         run: docker run --rm gitexplore-api:verify gitexplore --help
+
+      - name: Verify self-contained production image fallback
+        if: needs.changes.outputs.source_build == 'true'
+        run: |
+          rm .gitexplore-release/gitexplore .gitexplore-release/source.sha256
+          docker build --file Dockerfile.vercel --tag gitexplore-api:fallback .
+          docker run --rm gitexplore-api:fallback gitexplore --help
 
   verify:
     name: Rust and browser checks
@@ -140,9 +159,15 @@ jobs:
         shell: bash
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          PRODUCTION_API: ${{ needs.changes.outputs.production_api }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           IMAGE_RESULT: ${{ needs.production_image.result }}
         run: |
           test "$CHANGES_RESULT" = "success"
           test "$QUALITY_RESULT" = "success"
-          test "$IMAGE_RESULT" = "success" || test "$IMAGE_RESULT" = "skipped"
+          if [ "$PRODUCTION_API" = "true" ]; then
+            test "$IMAGE_RESULT" = "success"
+          else
+            test "$PRODUCTION_API" = "false"
+            test "$IMAGE_RESULT" = "skipped"
+          fi

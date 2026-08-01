@@ -10,3 +10,4 @@ apps/web/.vercel/
 .vercel/
 .gitexplore-*.png
 .gitexplore-release/gitexplore
+.gitexplore-release/source.sha256
