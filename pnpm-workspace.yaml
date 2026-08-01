@@ -2,5 +2,23 @@ packages:
   - apps/*
   - packages/*
 allowBuilds:
-  '@tailwindcss/oxide': true
   esbuild: true
+overrides:
+  "js-yaml@>=4.0.0 <4.3.0": 4.3.0
+  "minimatch@>=10.0.0 <10.2.3": 10.2.6
+  "path-to-regexp@>=4.0.0 <6.3.0": 6.3.0
+  "path-to-regexp@>=8.0.0 <8.4.0": 8.4.0
+  "tar@>=7.0.0 <=7.5.18": 7.5.22
+  "undici@>=6.0.0 <6.27.0": 6.28.0
+auditConfig:
+  ignoreGhsas:
+    # Browser-only React Router library mode; the advisory only affects unstable RSC APIs.
+    - GHSA-qwww-vcr4-c8h2
+    # Vercel CLI release toolchain; it is not shipped and never opens attacker-controlled WebSockets.
+    # Remove these exceptions once the pinned Vercel toolchain no longer resolves Undici 5.x.
+    - GHSA-vrm6-8vpv-qv8q
+    - GHSA-v9p9-hfj2-hcw8
+    - GHSA-vxpw-j846-p89q
+minimumReleaseAgeExclude:
+  - strawn-icons@0.1.1
+  - strawn@0.2.0

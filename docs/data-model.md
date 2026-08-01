@@ -114,7 +114,7 @@ flowchart LR
     session["BrowserSession {id_digest, user_id, expires_at}"]
     user["Shared User"]
     repo["Shared Repository"]
-    sync["SyncState {user_id, ...}"]
+    sync["SyncState {user_id, sync fields,\ndiscovery warmup state}"]
 
     local -->|"OWNS_CATEGORY"| category
     local -->|"CREATED_BOOKMARK"| bookmark
@@ -127,7 +127,9 @@ flowchart LR
     local -. "same id only; no stored relationship" .-> sync
 ```
 
-`SyncState` is keyed directly by `user_id`; the current adapter does not add a relationship from `LocalUser`. `GitHubIdentity.github_user_id` and `.user_id` are each unique, preserving the same canonical private overlay when an account reconnects. Disconnect removes credential properties but retains this stable link. `OAuthPendingState` is unlinked and short-lived. Neo4j receives only authenticated ciphertext for GitHub tokens and nonces, plus keyed digests for OAuth state and browser-session identifiers; raw tokens and cookie values are never stored in graph properties.
+`SyncState` is keyed directly by `user_id`; the current adapter does not add a relationship from `LocalUser`. It also owns that app user's serialized discovery-warmup job and a separately queryable status. The private job contains its id, connected-account seed, deduplicated expanded/frontier logins, current login, reserve observation, timestamps, and bounded error. Expanded and pending logins share a 10,000-user total bound, chosen to keep one private job well below the 190,000-node production import boundary. Once that bound is reached, additional candidates set `frontierTruncated` and are not retained, so exhausting the retained frontier still terminates the job. Neo4j updates this state only while the caller owns the fenced `discovery-warmup:<user_id>` `RefreshLease`; public users, repositories, and relationships discovered by the job still enter the shared graph.
+
+`GitHubIdentity.github_user_id` and `.user_id` are each unique, preserving the same canonical private overlay when an account reconnects. Disconnect removes credential properties but retains this stable link. `OAuthPendingState` is unlinked and short-lived. Neo4j receives only authenticated ciphertext for GitHub tokens and nonces, plus keyed digests for OAuth state and browser-session identifiers; raw tokens and cookie values are never stored in graph properties.
 
 Saving a repository creates:
 
@@ -148,7 +150,7 @@ Authoritative expansion assigns a six-hour freshness window to the expanded user
 - A user that appears only in someone else's followers/following list has no neighborhood fetch timestamp and is treated as stale.
 - If any collection has incomplete coverage, `neighborhood_stale_at` is set to the fetch time and the neighborhood remains `STALE`; preserving prior edges avoids treating a capped prefix as the complete GitHub graph.
 - Persisted legacy data with no coverage fields is read as all four collections incomplete, not optimistically complete, and remains stale until a current refresh records explicit coverage.
-- `last_refresh_error` is part of the persisted cache shape, although explicit GraphQL expansion is currently synchronous rather than worker-driven.
+- `last_refresh_error` is part of the persisted cache shape. Explicit `expandUser` remains synchronous; discovery warmup invokes that same expansion path from a bounded background batch.
 
 ## Schema constraints and indexes
 
@@ -196,10 +198,11 @@ Implemented:
 - private bookmarks, categories, snapshots, sync state, and saved projections
 - durable, encrypted GitHub connections plus replica-safe OAuth state and browser sessions in Neo4j
 - durable per-identity GitHub REST status and fenced refresh-budget leases
+- private, durable discovery-warmup jobs with fenced resumable progress and shared public imports
 - coverage-aware transactional Neo4j collection replacement/merging and constraint-backed, transactional bookmark saves
 - compatibility reads for legacy `MEMBER_OF`
 
 Future work:
 
 - persisted private click history
-- durable background refresh jobs and queued rate-budget scheduling
+- general-purpose queued refresh and rate-budget scheduling beyond discovery warmup

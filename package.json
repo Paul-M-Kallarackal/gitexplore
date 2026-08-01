@@ -3,9 +3,8 @@
   "private": true,
   "designSystem": {
     "package": "strawn",
-    "version": "0.1.0",
-    "source": "../../../../strawn",
-    "commit": "7c4bc3421f41cfd91aaa970c2066e8382853d3da"
+    "version": "0.2.0",
+    "source": "npm"
   },
   "packageManager": "pnpm@11.7.0",
   "scripts": {
@@ -14,9 +13,13 @@
     "test": "turbo test",
     "lint": "turbo lint",
     "check": "turbo check",
-    "production:check": "node .github/scripts/verify-production-contract.mjs"
+    "production:check": "node .github/scripts/verify-production-contract.mjs",
+    "production:smoke": "node .github/scripts/verify-live-frontend.mjs"
   },
   "devDependencies": {
+    "@emnapi/core": "1.11.1",
+    "@emnapi/runtime": "1.11.1",
+    "@playwright/test": "1.61.1",
     "turbo": "^2.5.8",
     "vercel": "56.3.1"
   }

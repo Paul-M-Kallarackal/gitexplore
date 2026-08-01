@@ -160,6 +160,56 @@ Public graph lookups use lowercase normalized aliases, but user and repository i
 
 For each collection with complete coverage, GitExplore deletes the corresponding prior `FOLLOWS`, `STARRED`, or `OWNS` edges and inserts the current authoritative set. For each partial collection, it preserves existing edges and merges the fetched entries, avoiding destructive replacement from a capped prefix. If any collection is partial, the neighborhood remains `STALE`. Neo4j performs the complete replacements and partial merges in one transaction; a failure rolls back the entire import.
 
+### Warm the discovery graph
+
+`startDiscoveryWarmup` starts one private job for the authenticated app user; it accepts no identity or seed argument. The connected GitHub login is the seed. Repeated starts return the same active job, so browser retries cannot create duplicate work. `COMPLETED` remains idempotently complete. A `RESERVE_PROTECTED` job is also returned unchanged before its recorded reset; an explicit start after that reset atomically requeues the same job id with its existing frontier and progress. A start after `FAILED` creates a new attempt.
+
+```graphql
+mutation StartDiscoveryWarmup {
+  startDiscoveryWarmup {
+    id
+    seedLogin
+    status
+    expandedUsers
+    discoveredUsers
+    pendingUsers
+    remainingRequests
+    reserveRequests
+    resetAt
+    lastError
+  }
+}
+```
+
+`discoveryWarmup` reads only the current session owner's job and returns `null` before the first start:
+
+```graphql
+query DiscoveryWarmup {
+  discoveryWarmup {
+    id
+    status
+    currentLogin
+    expandedUsers
+    discoveredUsers
+    pendingUsers
+    frontierTruncated
+    remainingRequests
+    reserveRequests
+    resetAt
+    startedAt
+    updatedAt
+    completedAt
+    lastError
+  }
+}
+```
+
+The status is `QUEUED`, `RUNNING`, `COMPLETED`, `RESERVE_PROTECTED`, or `FAILED`. `COMPLETED` means the stored frontier was exhausted. `RESERVE_PROTECTED` means either the post-batch observation reached 1,000 or the next expansion's conservative 13-request maximum could not fit above that floor; `remainingRequests` always exposes the actual count, so this status can honestly stop between 1,000 and 1,012. Status reads and startup recovery do not retry this terminal state. After `resetAt`, an explicit start preserves the same job and continues its frontier. `FAILED` retains a bounded error message and a later start creates a new attempt.
+
+The worker performs one user expansion per batch and yields between batches. The local scheduler scans durable runnable jobs in limited batches, runs at most four concurrently, and refills a worker slot after each batch. A fresh shared neighborhood is reused only when all four collections have complete coverage; the read still uses the current app user so private saved projections remain private. Missing, stale, or incomplete neighborhoods go through GitHub. Cache-only batches do not spend or enforce a stale stored REST observation; the next cache miss performs the normal reserve preflight.
+
+Following and follower logins extend a deduplicated breadth-first frontier. Expanded and pending logins together are capped at 10,000 users, well below the 190,000-node production import boundary; `frontierTruncated` reports dropped candidates, and the job completes after the retained frontier is exhausted. Every GitHub-backed public expansion still uses `github-user:<login>` deduplication, the authenticated account's fenced rate-budget lease, and the transactional shared-graph import. A separate `discovery-warmup:<app-user-id>` lease fences private progress writes. Neo4j stores the job on that user's `SyncState`; startup resumes `QUEUED` and `RUNNING` jobs, and a crash retries at most the uncommitted current frontier entry after lease expiry.
+
 ### Save a repository
 
 ```graphql
@@ -182,7 +232,7 @@ mutation SaveRepository(
 }
 ```
 
-The target repository must already exist in the shared imported graph. A save is private to the authenticated app user and is idempotent by repository target: saving the same repository again returns the existing bookmark rather than creating a duplicate or replacing its original categories/note. The current explorer UI saves with empty categories and no note; the mutation supports both for other clients on the first save.
+The target repository must already exist in the shared imported graph. A save is private to the authenticated app user and is idempotent by repository target: saving the same repository again returns the existing bookmark rather than creating a duplicate or replacing its original categories/note. The mutation accepts categories and an optional note on the first save.
 
 On Neo4j, bookmark creation and relationship writes share one transaction. A composite uniqueness constraint on `(user_id, target_kind, target_github_id)` backs the idempotent owner/target identity.
 
@@ -231,7 +281,7 @@ The entry route:
 
 Opening a valid login creates `/app/explore/<login>?trail=<login>`.
 
-### `/app/explore/[login]`
+### `/app/explore/:login`
 
 The node route:
 
@@ -240,20 +290,37 @@ The node route:
 3. keeps cached results visible during an explicit refresh
 4. shows which collections are partial when GraphQL coverage is incomplete
 5. renders direction-preserving Followers and Following lanes
-6. appends each clicked login to the URL `trail`
+6. appends each clicked login to the URL `trail`, bounded to the eight most recent entries
 7. lets every breadcrumb return to the corresponding trail prefix
 8. renders ranked repository cards with score, reasons, path accounts, metadata, and private save state
 9. calls `saveRepository` and updates the local query cache after a successful save
 
 The trail is URL state, not persisted private click history. It is therefore refreshable and shareable, while durable click-history storage remains future work.
 
-## Strawn token contract
+### Saved and Settings
 
-The root `package.json` selects Strawn `0.1.0` from the canonical Strawn repository at commit `7c4bc3421f41cfd91aaa970c2066e8382853d3da`.
+The authenticated React shell has three primary areas:
 
-Strawn's public component package is React-based, while GitExplore is Svelte. `packages/ui/src/tokens.css` is therefore a Svelte adapter over the consumed subset of the framework-neutral Strawn `0.1.0` semantic token contract from `packages/strawn/src/theme.ts`, not a second product design system. That subset covers the light/dark semantic colors, core fonts/type, commonly used spacing/radii/shadows, control sizes, layers, and core motion needed by GitExplore. `apps/web/src/routes/layout.css` imports the adapter, and product-specific Svelte components remain owned by `packages/ui`.
+- Explore owns follower/following traversal and repository discovery.
+- Saved owns bookmark, collection, and exploration-history views.
+- Settings owns synchronization, request-budget visibility, and account controls.
 
-When the design-system selection changes, update the manifest pin and token adapter together. Do not invent product-local replacements for an exported Strawn semantic token.
+Repository detail remains a contextual deep link rather than a fourth primary destination. The router preserves old entry points with these redirects:
+
+| Former URL | React destination |
+| --- | --- |
+| `/app/bookmarks` | `/app/saved?view=bookmarks` |
+| `/app/categories` | `/app/saved?view=collections` |
+| `/app/explore/snapshots` | `/app/saved?view=history` |
+| `/app/sync` | `/app/settings` |
+
+## Strawn contract
+
+`apps/web/package.json` and `ribbon.json` select the released Strawn package version and canonical source commit used by GitExplore.
+
+The React app imports components and semantic tokens only from the `strawn` root entrypoint and icons only from the `strawn-icons` root entrypoint. Product-specific graph lanes, expedition trails, discovery cards, and application-shell composition remain in `apps/web`; GitExplore does not copy Strawn tokens or maintain a local design-system adapter.
+
+When the design-system selection changes, update the package pin and manifest commit together. Do not deep-import Strawn internals or invent product-local replacements for an exported semantic token.
 
 ## Legacy REST compatibility
 
@@ -291,13 +358,12 @@ Implemented now:
 - transactional, constraint-backed per-user private saves on Neo4j
 - cookie-authenticated GraphQL
 - bounded one-time OAuth state/nonce validation, durable bounded sessions, and canonical same-account reconnects
-- Svelte click trail and repository save workflow
+- React click trail, compatibility routing, and repository save workflow
 - durable per-GitHub-identity REST budget status and fenced crawl serialization with a strict 1,000-request reserve
+- durable, resumable, per-user discovery warmup with bounded batches and authenticated GraphQL status
 
 Not implemented:
 
-- background expansion workers
-- a durable background refresh queue
 - general-purpose queued GitHub rate-budget scheduling beyond the synchronous reserve gate
 - persisted private click history
 

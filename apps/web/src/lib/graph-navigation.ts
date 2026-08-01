@@ -1,5 +1,6 @@
 const githubLoginPattern = /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i;
 export const maxTrailEntries = 8;
+export type ConnectionDirection = 'followers' | 'following';
 
 export function normalizeLoginInput(value: string) {
 	let login = value.trim();
@@ -20,12 +21,15 @@ export function isLikelyGitHubLogin(value: string) {
 
 export function normalizeTrail(value: string | null, currentLogin: string) {
 	const current = normalizeLoginInput(currentLogin);
-	const trail = (value ?? '')
+	return appendTrail(parseTrail(value), current);
+}
+
+export function parseTrail(value: string | null) {
+	return (value ?? '')
 		.split(',')
 		.map(normalizeLoginInput)
-		.filter((login) => githubLoginPattern.test(login));
-
-	return appendTrail(trail, current);
+		.filter((login) => githubLoginPattern.test(login))
+		.slice(-maxTrailEntries);
 }
 
 export function appendTrail(trail: string[], login: string) {
@@ -49,16 +53,50 @@ export function appendTrail(trail: string[], login: string) {
 	return nextTrail.slice(-maxTrailEntries);
 }
 
-export function buildExploreHref(login: string, trail: string[] = []) {
+export function normalizeConnectionDirection(value: string | null | undefined): ConnectionDirection {
+	return value === 'following' ? 'following' : 'followers';
+}
+
+export function setConnectionDirection(
+	searchParams: URLSearchParams,
+	direction: string
+) {
+	const next = new URLSearchParams(searchParams);
+	next.set('direction', normalizeConnectionDirection(direction));
+	return next;
+}
+
+export function buildExploreHref(
+	login: string,
+	trail: string[] = [],
+	direction?: ConnectionDirection
+) {
 	const target = normalizeLoginInput(login);
 	const nextTrail = appendTrail(trail, target);
 	const search = new URLSearchParams({ trail: nextTrail.join(',') });
+	if (direction) search.set('direction', direction);
 
 	return `/app/explore/${encodeURIComponent(target)}?${search.toString()}`;
 }
 
-export function buildTrailHref(trail: string[], index: number) {
+export function buildRepositoryHref(
+	fullName: string,
+	trail: string[] = [],
+	direction?: ConnectionDirection
+) {
+	const [owner = '', repository = ''] = fullName.split('/', 2);
+	const search = new URLSearchParams({ trail: parseTrail(trail.join(',')).join(',') });
+	if (direction) search.set('direction', direction);
+
+	return `/app/repository/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}?${search.toString()}`;
+}
+
+export function buildTrailHref(
+	trail: string[],
+	index: number,
+	direction?: ConnectionDirection
+) {
 	const prefix = trail.slice(0, index + 1);
 	const login = prefix.at(-1) ?? '';
-	return buildExploreHref(login, prefix.slice(0, -1));
+	return buildExploreHref(login, prefix.slice(0, -1), direction);
 }

@@ -5,8 +5,7 @@
 .gitexplore-data/
 node_modules/
 .turbo/
-apps/web/.svelte-kit/
-apps/web/build/
+apps/web/dist/
 apps/web/.vercel/
 .vercel/
 .gitexplore-*.png

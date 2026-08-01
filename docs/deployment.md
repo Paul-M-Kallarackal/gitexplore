@@ -1,6 +1,6 @@
 # Production deployment
 
-GitExplore targets one Vercel Services project at `gitexplore.moriatz.com`. The SvelteKit frontend and Rust/Axum API deploy atomically and share one browser origin. Neo4j remains an external managed graph database.
+GitExplore targets one Vercel Services project at `gitexplore.moriatz.com`. The React/Vite frontend and Rust/Axum API deploy atomically and share one browser origin. Neo4j remains an external managed graph database.
 
 This document describes the deployment scaffold. It does not claim that the production URL is live. `ribbon.json` remains `status: local` until the live checks pass. Its separate `productionReadiness` field is a fail-closed declaration that provider, secret, schema, build, and release prerequisites are ready for a production deployment attempt.
 
@@ -8,13 +8,13 @@ This document describes the deployment scaffold. It does not claim that the prod
 
 `vercel.json` declares two services:
 
-- `web` owns the SvelteKit application and receives the catch-all route.
+- `web` builds the React/Vite single-page application and receives the catch-all route after API routes are matched.
 - `api` builds `Dockerfile.vercel` as a Rust container and receives `/auth/*`, `/graphql`, `/health`, `/sync/*`, `/bookmarks`, `/categories`, and `/explore*`.
-- The web service receives `GITEXPLORE_INTERNAL_API_BASE_URL` through a private Vercel service binding.
+- `apps/web/vercel.json` supplies the SPA fallback so direct React Router entry points resolve to `index.html`.
 
 The linked Vercel project's Framework Preset must be set to **Services**. Vercel only activates this topology when that project setting and the top-level `services` configuration are both present. Automatic Vercel Git deployments are disabled in `vercel.json`; the protected, main-only release workflow owns production builds and domain updates.
 
-The public browser API base must use the same deployed origin. For production it is `https://gitexplore.moriatz.com`. The GitHub OAuth callback must be registered exactly as:
+The browser uses same-origin API paths; Vercel routes those paths to the API service before sending other requests to the web service. The GitHub OAuth callback must be registered exactly as:
 
 ```text
 https://gitexplore.moriatz.com/auth/oauth/callback
@@ -22,7 +22,7 @@ https://gitexplore.moriatz.com/auth/oauth/callback
 
 Vercel supplies `PORT` to the Rust container. `AppConfig` binds `0.0.0.0:<PORT>` when `GITEXPLORE_SERVER_ADDR` is not explicitly set, preserving the existing local override.
 
-`Dockerfile.vercel` also fixes `GITEXPLORE_DEPLOYMENT_MODE=production` and `GITEXPLORE_GRAPH_BACKEND=neo4j`. Production startup fails closed unless the frontend origin is HTTPS, the exact OAuth callback and credentials exist, the Neo4j URI is encrypted, identity encryption is configured, and both database capacity limits exist. The web runtime falls back to the incoming same-origin URL—not localhost—if its explicit public API setting is unavailable.
+`Dockerfile.vercel` also fixes `GITEXPLORE_DEPLOYMENT_MODE=production` and `GITEXPLORE_GRAPH_BACKEND=neo4j`. Production startup fails closed unless the frontend origin is HTTPS, the exact OAuth callback and credentials exist, the Neo4j URI is encrypted, identity encryption is configured, and both database capacity limits exist. The static web bundle contains no API host; browser requests remain on the incoming origin.
 
 ## Fail-closed production blockers
 
@@ -69,11 +69,7 @@ Vercel server-only runtime values:
 - `GITEXPLORE_NEO4J_MAX_TOTAL_NODES=190000`
 - `GITEXPLORE_NEO4J_MAX_TOTAL_RELATIONSHIPS=380000`
 
-Browser-visible Vercel configuration:
-
-- `PUBLIC_GITEXPLORE_API_BASE_URL=https://gitexplore.moriatz.com`
-
-The web service's internal API URL is injected by the `api` service binding; do not duplicate it as a public secret.
+The browser bundle requires no API-origin environment variable. Keep server credentials out of the web service; same-origin routing is part of the checked deployment contract.
 
 Hostinger DNS remains local to Ribbon. Import the DNS credential through Ribbon's secure credential path, then provision only the manifest hostname. `ribbon.json` records the project-specific, Vercel-inspected TTL-300 CNAME target for `gitexplore.moriatz.com`; Ribbon must stop rather than guess or replace a conflicting record type.
 
@@ -146,9 +142,10 @@ Production is released only by a reviewed change merged to `main`:
 4. Open a pull request and wait for required checks and review.
 5. Merge to `main`; do not run a local production deployment.
 6. The release workflow restores exact-version caches, verifies Rust, browser, and production contracts, applies and checks the embedded Aura schema migration, uses the lockfile-pinned Vercel CLI, pulls production settings, builds once, and deploys with `--prebuilt --prod`.
-7. The workflow waits for Vercel readiness, assigns the custom domain, then verifies canonical TLS, Neo4j-backed `/health`, unauthenticated auth shape, the frontend, and security headers before uploading `deployment.json`.
-8. Exercise GitHub login, session persistence across a rerun of the same release, GraphQL exploration, repository bookmarks, rate-limit visibility, and Neo4j cache reads.
-9. Inspect browser errors and Vercel logs before recording the production URL and changing the Ribbon status to `production`.
+7. After DNS, TLS, API, and security-header probes pass, pinned Chromium boots the canonical `/login` and protected `/app/explore` routes at a 375px viewport. The smoke test fails on missing scripts/styles, browser errors, broken SPA rewrites, malformed OAuth return paths, horizontal overflow, or collapsed display typography.
+8. The workflow waits for Vercel readiness, assigns the custom domain, then verifies canonical TLS, Neo4j-backed `/health`, unauthenticated auth shape, the frontend, and security headers before uploading `deployment.json`.
+9. Exercise GitHub login, session persistence across a rerun of the same release, GraphQL exploration, repository bookmarks, rate-limit visibility, and Neo4j cache reads.
+10. Inspect browser errors and Vercel logs before recording the production URL and changing the Ribbon status to `production`.
 
 The Aura instance and GitHub OAuth application are provisioned, with rotated server credentials installed in Vercel Production and GitHub Actions. The embedded migration was applied and checked successfully against Aura from the Linux production image. Production prerequisites are ready, but the deployment, replacement-instance session check, DNS/TLS result, and complete live product verification still need to finish before `ribbon.json.status` can change to `production`.
 
@@ -158,5 +155,5 @@ The Aura instance and GitHub OAuth application are provisioned, with rotated ser
 - [Authentication flow](ui-login-flow.md)
 - [Graph architecture](graph-explorer.md)
 - [Vercel Services](https://vercel.com/docs/services)
-- [SvelteKit on Vercel](https://vercel.com/docs/frameworks/full-stack/sveltekit)
+- [Vite on Vercel](https://vercel.com/docs/frameworks/frontend/vite)
 - [Docker on Vercel](https://vercel.com/blog/dockerfile-on-vercel)

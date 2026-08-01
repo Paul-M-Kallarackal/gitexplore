@@ -22,7 +22,7 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -43,9 +43,10 @@ mod tests {
         discovery::RepositoryReasonKind,
         exploration::ExplorationSeed,
         graph::{
-            CacheStatus, GitHubRateLimitLease, GitHubRateLimitStatus, GitHubRepositoryNode,
-            GitHubUserNode, GraphImport, GraphImportCoverage, RefreshLease, RefreshLeaseAttempt,
-            RefreshLeaseState, RefreshLeaseStatus, SyncState, SyncSummary, UserRefreshOutcome,
+            CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus, GitHubRateLimitLease,
+            GitHubRateLimitStatus, GitHubRepositoryNode, GitHubUserNode, GraphImport,
+            GraphImportCoverage, RefreshLease, RefreshLeaseAttempt, RefreshLeaseState,
+            RefreshLeaseStatus, SyncState, SyncSummary, UserRefreshOutcome,
         },
         identity::{ConnectedAccount, GitHubConnection},
         insights::{
@@ -534,6 +535,13 @@ mod tests {
             .await
             .expect("auth status response");
         assert_eq!(auth_response.status(), StatusCode::OK);
+        assert_eq!(
+            auth_response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store")
+        );
         let auth_body = to_bytes(auth_response.into_body(), usize::MAX)
             .await
             .expect("auth status body");
@@ -1466,6 +1474,315 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_warmup_start_is_idempotent_and_deduplicates_work() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "default", 99, "alice").await;
+        let github = Arc::new(WarmupGitHubClient::new([(99, 1_013)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        let first = services.discovery.clone();
+        let second = services.discovery.clone();
+        let (first, second) = tokio::join!(
+            first.start_warmup("default"),
+            second.start_warmup("default")
+        );
+
+        assert_eq!(
+            first.expect("first warmup start").id,
+            second.expect("idempotent warmup start").id
+        );
+        let completed = wait_for_warmup(&services, "default").await;
+        assert_eq!(completed.status, DiscoveryWarmupStatus::ReserveProtected);
+        assert_eq!(github.graph_calls("alice"), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_warmup_reuses_a_fresh_complete_public_neighborhood() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "default", 99, "alice").await;
+        let github = Arc::new(WarmupGitHubClient::new([(99, 1_013)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        services
+            .discovery
+            .expand_user("default", "alice")
+            .await
+            .expect("prime the shared public neighborhood cache");
+        assert_eq!(github.graph_calls("alice"), 1);
+
+        services
+            .discovery
+            .start_warmup("default")
+            .await
+            .expect("start warmup from the cached seed");
+        let completed = wait_for_warmup(&services, "default").await;
+
+        assert_eq!(completed.status, DiscoveryWarmupStatus::ReserveProtected);
+        assert_eq!(completed.expanded_logins, vec!["alice"]);
+        assert_eq!(github.graph_calls("alice"), 1);
+        assert_eq!(github.total_graph_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_warmup_progress_ignores_a_stored_exhausted_budget_until_a_cache_miss() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "default", 99, "alice").await;
+        repositories
+            .imports
+            .import_github_graph(
+                "cache-primer",
+                GraphImport {
+                    viewer: Some(test_user(1, "alice")),
+                    following: vec![test_user(2, "bob")],
+                    coverage: GraphImportCoverage::default(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prime a complete alice neighborhood");
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        repositories
+            .sync_state
+            .start_discovery_warmup(
+                "default",
+                DiscoveryWarmupJob {
+                    id: "cached-budget-warmup".to_string(),
+                    seed_login: "alice".to_string(),
+                    status: DiscoveryWarmupStatus::Running,
+                    current_login: Some("alice".to_string()),
+                    expanded_logins: Vec::new(),
+                    frontier: vec!["alice".to_string()],
+                    frontier_truncated: false,
+                    remaining_requests: Some(1_000),
+                    reserve_requests: 1_000,
+                    reset_at: None,
+                    started_at,
+                    updated_at: started_at,
+                    completed_at: None,
+                    last_error: None,
+                },
+            )
+            .await
+            .expect("seed cached warmup progress");
+        let github = Arc::new(WarmupGitHubClient::new([(99, 1_000)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        services
+            .discovery
+            .resume_warmups()
+            .await
+            .expect("resume the cached warmup");
+        let completed = wait_for_warmup(&services, "default").await;
+
+        assert_eq!(completed.status, DiscoveryWarmupStatus::ReserveProtected);
+        assert_eq!(completed.expanded_logins, vec!["alice"]);
+        assert_eq!(completed.frontier, vec!["bob"]);
+        assert_eq!(github.total_graph_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_warmup_scheduler_caps_workers_and_refills_them() {
+        let repositories = LocalRepositorySet::in_memory();
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let mut budgets = Vec::new();
+        let mut user_ids = Vec::new();
+        for index in 0..8 {
+            let user_id = format!("app-user-{index}");
+            let login = format!("seed-{index}");
+            let github_user_id = 100 + i64::from(index);
+            save_test_connection(&repositories, &user_id, github_user_id, &login).await;
+            repositories
+                .sync_state
+                .start_discovery_warmup(
+                    &user_id,
+                    DiscoveryWarmupJob {
+                        id: format!("warmup-{index}"),
+                        seed_login: login.clone(),
+                        status: DiscoveryWarmupStatus::Queued,
+                        current_login: None,
+                        expanded_logins: Vec::new(),
+                        frontier: vec![login],
+                        frontier_truncated: false,
+                        remaining_requests: None,
+                        reserve_requests: 1_000,
+                        reset_at: None,
+                        started_at,
+                        updated_at: started_at,
+                        completed_at: None,
+                        last_error: None,
+                    },
+                )
+                .await
+                .expect("seed runnable warmup");
+            budgets.push((github_user_id, 1_013));
+            user_ids.push(user_id);
+        }
+        let github = Arc::new(WarmupGitHubClient::new(budgets));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        services
+            .discovery
+            .resume_warmups()
+            .await
+            .expect("start bounded recovery scheduler");
+        for user_id in &user_ids {
+            let completed = wait_for_warmup(&services, user_id).await;
+            assert_eq!(completed.status, DiscoveryWarmupStatus::ReserveProtected);
+        }
+
+        assert_eq!(github.total_graph_calls(), user_ids.len());
+        assert_eq!(github.max_active_graph_calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn discovery_warmup_resumes_durable_running_progress() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "default", 99, "alice").await;
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        repositories
+            .sync_state
+            .start_discovery_warmup(
+                "default",
+                DiscoveryWarmupJob {
+                    id: "durable-warmup".to_string(),
+                    seed_login: "alice".to_string(),
+                    status: DiscoveryWarmupStatus::Running,
+                    current_login: Some("bob".to_string()),
+                    expanded_logins: vec!["alice".to_string()],
+                    frontier: vec!["bob".to_string()],
+                    frontier_truncated: false,
+                    remaining_requests: Some(1_013),
+                    reserve_requests: 1_000,
+                    reset_at: None,
+                    started_at,
+                    updated_at: started_at,
+                    completed_at: None,
+                    last_error: None,
+                },
+            )
+            .await
+            .expect("seed durable warmup progress");
+        let github = Arc::new(WarmupGitHubClient::new([(99, 1_013)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        services
+            .discovery
+            .resume_warmups()
+            .await
+            .expect("resume durable warmups");
+
+        let completed = wait_for_warmup(&services, "default").await;
+        assert_eq!(completed.id, "durable-warmup");
+        assert_eq!(completed.status, DiscoveryWarmupStatus::ReserveProtected);
+        assert_eq!(completed.expanded_logins, vec!["alice", "bob"]);
+        assert_eq!(github.graph_calls("alice"), 0);
+        assert_eq!(github.graph_calls("bob"), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_warmup_stops_at_the_strict_rest_reserve() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "default", 99, "alice").await;
+        let github = Arc::new(WarmupGitHubClient::new([(99, 1_026)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        services
+            .discovery
+            .start_warmup("default")
+            .await
+            .expect("start warmup");
+
+        let completed = wait_for_warmup(&services, "default").await;
+        assert_eq!(completed.status, DiscoveryWarmupStatus::ReserveProtected);
+        assert_eq!(completed.remaining_requests, Some(1_000));
+        assert_eq!(completed.reserve_requests, 1_000);
+        assert_eq!(completed.expanded_users(), 2);
+        assert_eq!(github.remaining(99), 1_000);
+        assert_eq!(github.total_graph_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn discovery_warmup_resumes_the_same_frontier_after_rate_reset() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "default", 99, "alice").await;
+        let github = Arc::new(WarmupGitHubClient::new([(99, 1_013)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        let started = services
+            .discovery
+            .start_warmup("default")
+            .await
+            .expect("start warmup");
+        let first_window = wait_for_warmup(&services, "default").await;
+        assert_eq!(first_window.status, DiscoveryWarmupStatus::ReserveProtected);
+        assert_eq!(first_window.expanded_logins, vec!["alice"]);
+
+        github.set_remaining(99, 1_013);
+        services
+            .discovery
+            .resume_warmups()
+            .await
+            .expect("startup-style resume scan");
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert_eq!(github.graph_calls("alicex"), 0);
+        assert_eq!(
+            services
+                .discovery
+                .warmup_status("default")
+                .await
+                .expect("reserve-protected status")
+                .expect("warmup exists")
+                .status,
+            DiscoveryWarmupStatus::ReserveProtected
+        );
+
+        let resumed = services
+            .discovery
+            .start_warmup("default")
+            .await
+            .expect("resume after reset");
+        assert_eq!(resumed.id, started.id);
+
+        let second_window = wait_for_warmup(&services, "default").await;
+        assert_eq!(second_window.id, started.id);
+        assert_eq!(
+            second_window.status,
+            DiscoveryWarmupStatus::ReserveProtected
+        );
+        assert_eq!(second_window.expanded_logins, vec!["alice", "alicex"]);
+        assert_eq!(github.graph_calls("alice"), 1);
+        assert_eq!(github.graph_calls("alicex"), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_warmups_keep_private_progress_and_budgets_per_user() {
+        let repositories = LocalRepositorySet::in_memory();
+        save_test_connection(&repositories, "alice-app", 11, "alice").await;
+        save_test_connection(&repositories, "eve-app", 22, "eve").await;
+        let github = Arc::new(WarmupGitHubClient::new([(11, 1_013), (22, 1_013)]));
+        let services = warmup_test_services(&repositories, github.clone());
+
+        let (alice, eve) = tokio::join!(
+            services.discovery.start_warmup("alice-app"),
+            services.discovery.start_warmup("eve-app")
+        );
+        assert_ne!(alice.expect("alice warmup").id, eve.expect("eve warmup").id);
+
+        let (alice, eve) = tokio::join!(
+            wait_for_warmup(&services, "alice-app"),
+            wait_for_warmup(&services, "eve-app")
+        );
+        assert_eq!(alice.seed_login, "alice");
+        assert_eq!(alice.expanded_logins, vec!["alice"]);
+        assert_eq!(alice.remaining_requests, Some(1_000));
+        assert_eq!(eve.seed_login, "eve");
+        assert_eq!(eve.expanded_logins, vec!["eve"]);
+        assert_eq!(eve.remaining_requests, Some(1_000));
+        assert_eq!(github.remaining(11), 1_000);
+        assert_eq!(github.remaining(22), 1_000);
+    }
+
+    #[tokio::test]
     async fn github_rate_budget_enforces_exact_operation_boundaries() {
         let (services, github) = budget_test_services(1_013).await;
 
@@ -1633,6 +1950,69 @@ mod tests {
         assert!(extensions["resetAt"].is_string());
     }
 
+    #[tokio::test]
+    async fn discovery_warmup_graphql_uses_the_cookie_session_identity() {
+        let app = crate::http::router(Arc::new(seeded_http_state().await));
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("cookie", "gitexplore_session=test-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "query": "mutation { startDiscoveryWarmup { id seedLogin status reserveRequests } }"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("warmup start request"),
+            )
+            .await
+            .expect("warmup start response");
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let start_body = to_bytes(start_response.into_body(), usize::MAX)
+            .await
+            .expect("warmup start body");
+        let start_body: serde_json::Value =
+            serde_json::from_slice(&start_body).expect("warmup start json");
+        assert_eq!(
+            start_body["data"]["startDiscoveryWarmup"]["seedLogin"],
+            "alice"
+        );
+        assert_eq!(
+            start_body["data"]["startDiscoveryWarmup"]["reserveRequests"],
+            1_000
+        );
+        assert!(start_body["data"]["startDiscoveryWarmup"]["id"].is_string());
+
+        let status_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("cookie", "gitexplore_session=test-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "query": "query { discoveryWarmup { id seedLogin status } }"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("warmup status request"),
+            )
+            .await
+            .expect("warmup status response");
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .expect("warmup status body");
+        let status_body: serde_json::Value =
+            serde_json::from_slice(&status_body).expect("warmup status json");
+        assert_eq!(status_body["data"]["discoveryWarmup"]["seedLogin"], "alice");
+    }
+
     async fn budget_test_services(remaining: usize) -> (AppServices, Arc<BudgetGitHubClient>) {
         let repositories = LocalRepositorySet::in_memory();
         repositories
@@ -1733,6 +2113,216 @@ mod tests {
             }
             other => panic!("expected rate-budget reserve error, got {other}"),
         }
+    }
+
+    async fn save_test_connection(
+        repositories: &LocalRepositorySet,
+        user_id: &str,
+        github_user_id: i64,
+        login: &str,
+    ) {
+        repositories
+            .identity
+            .save_connection(
+                user_id,
+                GitHubConnection {
+                    account: ConnectedAccount {
+                        github_user_id,
+                        login: login.to_string(),
+                        display_name: Some(login.to_string()),
+                    },
+                    access_token: format!("{login}-token"),
+                    scopes: vec!["read:user".to_string()],
+                },
+            )
+            .await
+            .expect("save warmup test connection");
+    }
+
+    fn warmup_test_services(
+        repositories: &LocalRepositorySet,
+        github: Arc<WarmupGitHubClient>,
+    ) -> AppServices {
+        AppServices::new(
+            AppServiceRepositories {
+                identity: repositories.identity.clone(),
+                imports: repositories.imports.clone(),
+                sync_state: repositories.sync_state.clone(),
+                categories: repositories.categories.clone(),
+                bookmarks: repositories.bookmarks.clone(),
+                exploration: repositories.exploration.clone(),
+                discovery: repositories.discovery.clone(),
+                insights: repositories.insights.clone(),
+            },
+            github,
+            GitHubAuthConfig {
+                client_id: secrecy::SecretString::from("stub-client"),
+                client_secret: None,
+                redirect_uri: None,
+                scopes: vec!["read:user".to_string()],
+            },
+        )
+    }
+
+    async fn wait_for_warmup(services: &AppServices, user_id: &str) -> DiscoveryWarmupJob {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(warmup) = services
+                    .discovery
+                    .warmup_status(user_id)
+                    .await
+                    .expect("read warmup status")
+                    && !warmup.status.is_runnable()
+                {
+                    return warmup;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("warmup reached a terminal state")
+    }
+
+    struct WarmupGitHubClient {
+        remaining: Mutex<HashMap<i64, usize>>,
+        graph_calls: Mutex<HashMap<String, usize>>,
+        active_graph_calls: AtomicUsize,
+        max_active_graph_calls: AtomicUsize,
+    }
+
+    impl WarmupGitHubClient {
+        fn new(budgets: impl IntoIterator<Item = (i64, usize)>) -> Self {
+            Self {
+                remaining: Mutex::new(budgets.into_iter().collect()),
+                graph_calls: Mutex::new(HashMap::new()),
+                active_graph_calls: AtomicUsize::new(0),
+                max_active_graph_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn remaining(&self, github_user_id: i64) -> usize {
+            self.remaining
+                .lock()
+                .expect("warmup budget lock")
+                .get(&github_user_id)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn graph_calls(&self, login: &str) -> usize {
+            self.graph_calls
+                .lock()
+                .expect("warmup graph-call lock")
+                .get(login)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn set_remaining(&self, github_user_id: i64, remaining: usize) {
+            self.remaining
+                .lock()
+                .expect("warmup budget lock")
+                .insert(github_user_id, remaining);
+        }
+
+        fn total_graph_calls(&self) -> usize {
+            self.graph_calls
+                .lock()
+                .expect("warmup graph-call lock")
+                .values()
+                .sum()
+        }
+
+        fn max_active_graph_calls(&self) -> usize {
+            self.max_active_graph_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl GitHubClientPort for WarmupGitHubClient {
+        async fn start_device_flow(
+            &self,
+            _config: &GitHubAuthConfig,
+        ) -> AppResult<DeviceLoginStart> {
+            Err(AppError::Unsupported("not used by this test".to_string()))
+        }
+
+        async fn finish_device_flow(
+            &self,
+            _config: &GitHubAuthConfig,
+            _device_code: &str,
+        ) -> AppResult<GitHubConnection> {
+            Err(AppError::Unsupported("not used by this test".to_string()))
+        }
+
+        async fn exchange_browser_code(
+            &self,
+            _config: &GitHubAuthConfig,
+            _code: &str,
+        ) -> AppResult<GitHubConnection> {
+            Err(AppError::Unsupported("not used by this test".to_string()))
+        }
+
+        async fn fetch_graph(&self, connection: &GitHubConnection) -> AppResult<GraphImport> {
+            self.fetch_user_graph(connection, &connection.account.login)
+                .await
+        }
+
+        async fn fetch_user_graph(
+            &self,
+            connection: &GitHubConnection,
+            login: &str,
+        ) -> AppResult<GraphImport> {
+            let active = self.active_graph_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_graph_calls
+                .fetch_max(active, Ordering::SeqCst);
+            *self
+                .graph_calls
+                .lock()
+                .expect("warmup graph-call lock")
+                .entry(login.to_string())
+                .or_default() += 1;
+            {
+                let mut remaining = self.remaining.lock().expect("warmup budget lock");
+                let budget = remaining
+                    .entry(connection.account.github_user_id)
+                    .or_default();
+                *budget = budget.saturating_sub(13);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            self.active_graph_calls.fetch_sub(1, Ordering::SeqCst);
+            let next_login = format!("{login}x");
+            Ok(GraphImport {
+                viewer: Some(test_user(warmup_github_id(login), login)),
+                following: vec![test_user(warmup_github_id(&next_login), &next_login)],
+                coverage: GraphImportCoverage::default(),
+                ..Default::default()
+            })
+        }
+
+        async fn fetch_core_rate_limit(
+            &self,
+            connection: &GitHubConnection,
+        ) -> AppResult<GitHubRateLimitStatus> {
+            let remaining = self.remaining(connection.account.github_user_id);
+            Ok(GitHubRateLimitStatus {
+                limit: 5_000,
+                used: 5_000usize.saturating_sub(remaining),
+                remaining,
+                reset_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+                checked_at: chrono::Utc::now(),
+            })
+        }
+
+        fn browser_oauth_url(&self, _config: &GitHubAuthConfig, _state: &str) -> AppResult<String> {
+            Err(AppError::Unsupported("not used by this test".to_string()))
+        }
+    }
+
+    fn warmup_github_id(login: &str) -> i64 {
+        login.bytes().fold(100_i64, |value, byte| {
+            value.saturating_mul(31).saturating_add(i64::from(byte))
+        })
     }
 
     struct BudgetGitHubClient {

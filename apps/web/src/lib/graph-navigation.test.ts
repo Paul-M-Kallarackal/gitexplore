@@ -3,10 +3,14 @@ import { describe, expect, it } from 'vitest';
 import {
 	appendTrail,
 	buildExploreHref,
+	buildRepositoryHref,
 	buildTrailHref,
 	isLikelyGitHubLogin,
+	normalizeConnectionDirection,
 	normalizeLoginInput,
-	normalizeTrail
+	normalizeTrail,
+	parseTrail,
+	setConnectionDirection
 } from './graph-navigation';
 
 describe('graph navigation', () => {
@@ -37,6 +41,32 @@ describe('graph navigation', () => {
 		expect(buildExploreHref('bob', ['alice'])).toBe('/app/explore/bob?trail=alice%2Cbob');
 		expect(buildTrailHref(['alice', 'bob', 'carol'], 1)).toBe(
 			'/app/explore/bob?trail=alice%2Cbob'
+		);
+	});
+
+	it('deep-links connection direction without dropping the trail', () => {
+		const nextSearch = setConnectionDirection(
+			new URLSearchParams('trail=alice%2Cbob'),
+			'following'
+		);
+
+		expect(normalizeConnectionDirection('following')).toBe('following');
+		expect(normalizeConnectionDirection('unknown')).toBe('followers');
+		expect(nextSearch.get('trail')).toBe('alice,bob');
+		expect(nextSearch.get('direction')).toBe('following');
+		expect(buildExploreHref('carol', ['alice', 'bob'], 'following')).toBe(
+			'/app/explore/carol?trail=alice%2Cbob%2Ccarol&direction=following'
+		);
+		expect(buildTrailHref(['alice', 'bob', 'carol'], 1, 'following')).toBe(
+			'/app/explore/bob?trail=alice%2Cbob&direction=following'
+		);
+	});
+
+	it('reads repository context without inventing a new graph hop', () => {
+		expect(parseTrail('alice,bob')).toEqual(['alice', 'bob']);
+		expect(parseTrail('alice,not a login,bob')).toEqual(['alice', 'bob']);
+		expect(buildRepositoryHref('quiet-labs/signal-map', ['alice', 'bob'], 'following')).toBe(
+			'/app/repository/quiet-labs/signal-map?trail=alice%2Cbob&direction=following'
 		);
 	});
 });

@@ -39,7 +39,7 @@ flowchart LR
     private["Private overlay\nsessions, sync state,\nbookmarks, categories, snapshots"]
     graphql["POST /graphql"]
     rest["Compatibility REST"]
-    web["SvelteKit UI"]
+    web["React/Vite UI"]
 
     github --> service
     service --> public
@@ -52,7 +52,7 @@ flowchart LR
     rest --> web
 ```
 
-Public GitHub identities, public repositories, and relationship facts are shared cache data. The authenticated app user owns connection credentials, the opaque browser session, bookmark state, categories, snapshots, and sync state. Repository discovery joins the shared facts to only the current user's save overlay. Browser connections are canonicalized by stable GitHub user id, so reconnecting the same GitHub account preserves that private overlay. The stable account link remains when credentials are disconnected.
+Public GitHub identities, public repositories, and relationship facts are shared cache data. The authenticated app user owns connection credentials, the opaque browser session, bookmark state, categories, snapshots, sync state, and discovery-warmup progress. Repository discovery joins the shared facts to only the current user's save overlay. Browser connections are canonicalized by stable GitHub user id, so reconnecting the same GitHub account preserves that private overlay. The stable account link remains when credentials are disconnected.
 
 Shared graph identity is also stable-id first. Lowercase `login_key` and `full_name_key` properties provide case-insensitive alias lookup, while GitHub's numeric user/repository ids remain canonical. A rename moves the existing stable node to its new alias; reuse of an old alias by a different numeric id does not merge the two histories.
 
@@ -75,21 +75,23 @@ Shared graph identity is also stable-id first. Lowercase `login_key` and `full_n
 - `src/graphql.rs` owns the GraphQL schema and maps domain values to the browser contract.
 - `src/http.rs` owns Axum routing, CORS, cookie resolution, OAuth redirects, and compatibility REST.
 - `packages/api_client/` owns credentialed REST and GraphQL request construction.
-- `apps/web/` owns SvelteKit route behavior and product presentation.
-- `packages/ui/` owns product-specific Svelte components and the Svelte adapter for GitExplore's consumed subset of the selected Strawn semantic-token contract.
+- `apps/web/` owns React route behavior and product presentation. It consumes only the public root exports of `strawn` and `strawn-icons` for the shared design-system surface.
+
+The authenticated application keeps three primary areas: Explore for graph traversal and discovery, Saved for bookmarks/collections/history, and Settings for synchronization, request budget, and account controls. Repository detail is a contextual deep link. Browser redirects preserve the former bookmarks, categories, snapshots, and sync entry points.
 
 ## Request flow
 
 1. Browser OAuth creates opaque, one-time durable state with a 10-minute lifetime and binds it to an `HttpOnly`, `SameSite=Lax` browser nonce. Neo4j stores only a keyed state digest and an authenticated-encrypted nonce, so any service replica can complete the callback.
 2. The callback validates and consumes both values. After token exchange, it probes the current `core` bucket and requires 1,001 requests before spending one on `GET /user`; it then canonicalizes the connection by stable GitHub user id, records the observed budget best-effort, and creates a 30-day server session represented by `gitexplore_session`.
 3. `POST /graphql` resolves that session before schema execution; operations never accept a client-selected user id.
-4. Browser requests use `PUBLIC_GITEXPLORE_API_BASE_URL`; SvelteKit server-side requests use `GITEXPLORE_INTERNAL_API_BASE_URL` and forward the session cookie only to that configured API origin.
+4. Browser requests target the current origin and include credentials. Vite proxies API paths during development; production service routes send the same paths to Rust under the shared browser origin.
 5. `neighborhood` reads the shared graph plus the current user's private `saved` state.
 6. `expandUser` synchronously fetches one public GitHub user's profile and imports at most 300 followers, 300 followed users, 300 starred repositories, and 300 owned repositories. Only public repositories enter the graph, and GraphQL reports coverage for each collection.
 7. Concurrent expansion calls first deduplicate in-process and then acquire a fenced Neo4j lease keyed by `github-user:<lowercase-login>`; file mode keeps the in-process behavior.
 8. The entity-refresh leader serializes GitHub REST work through the connected account's durable `GitHubIdentity` lease, probes the current `core` bucket, and admits the operation only when its maximum cost leaves the strict 1,000-request reserve.
 9. `saveRepository` creates or reuses the current user's private bookmark.
 10. Neo4j replaces prior edges only for collections reported complete. Partial capped collections preserve prior edges and merge the returned entries; both paths run in the graph-import transaction. Bookmark writes are also transactional, and bookmark identity is protected by the owner/target uniqueness constraint.
+11. `startDiscoveryWarmup` idempotently creates the current user's private warmup job. A background driver expands one frontier login per batch, reusing the public entity-refresh and private account-budget leases, until the frontier is exhausted or the reserve rejects the next bounded expansion.
 
 See [Graph explorer and GraphQL](graph-explorer.md) for operation examples and the frontend trail workflow.
 
@@ -97,9 +99,11 @@ See [Graph explorer and GraphQL](graph-explorer.md) for operation examples and t
 
 An authoritative user expansion records `last_fetched_at`, `stale_at`, `neighborhood_last_fetched_at`, and `neighborhood_stale_at`; the current TTL is six hours. Users merely encountered as neighbors do not inherit fresh-neighborhood metadata.
 
-`neighborhood` is a cache read. `expandUser` is an explicit synchronous refresh. The Svelte query cache keeps existing results visible while a refresh mutation is running. The in-process coordinator remains cancellation-safe, while Neo4j deployments add a five-minute, server-clock lease with opaque fencing tokens and one-minute renewal. Graph import validates and locks that token and records the durable outcome in the same transaction as the graph update. A killed replica is recoverable after lease expiry; stale owners cannot finish or clear a replacement lease. Cold contributor and commit-activity fetches use the same durable lease and renew ownership immediately before writing their shared cache.
+`neighborhood` is a cache read. `expandUser` is an explicit synchronous refresh. The React query cache keeps existing results visible while a refresh mutation is running. The in-process coordinator remains cancellation-safe, while Neo4j deployments add a five-minute, server-clock lease with opaque fencing tokens and one-minute renewal. Graph import validates and locks that token and records the durable outcome in the same transaction as the graph update. A killed replica is recoverable after lease expiry; stale owners cannot finish or clear a replacement lease. Cold contributor and commit-activity fetches use the same durable lease and renew ownership immediately before writing their shared cache.
 
 Every entity-refresh leader then acquires a fenced account-budget lease. GitExplore probes the authenticated GitHub REST `core` bucket before the data request and conservatively reserves 13 requests for a graph expansion, one for contributors, or three for public events. Work is rejected when that maximum would cross the 1,000-request floor. Operator crawls may select a higher floor, and the durable coordinator enforces that requested value for each expansion. The current status and UTC reset are persisted; stale cache reads continue, while cold or explicit work receives a typed reset-aware error.
+
+Discovery warmup stores its private breadth-first frontier and progress on the app user's constrained `SyncState` node. Each one-user batch is fenced by `discovery-warmup:<app-user-id>`, while its public expansion is independently deduplicated by `github-user:<login>`. Queued or running jobs are discovered through limited startup scans and a local scheduler runs at most four batches concurrently; a killed replica can therefore retry the current frontier entry after the warmup lease expires without creating an unbounded task set. Reserve-protected jobs remain stopped until an explicit start after their recorded GitHub reset requeues the same durable job. State advances only after the shared graph import succeeds. Fresh neighborhoods with complete coverage are read from the shared graph, retaining the current user's private saved projection, and spend no REST requests. The combined expanded-plus-pending set is capped at 10,000 users, deliberately far below the 190,000-node production import boundary; `frontierTruncated` reports dropped candidates and the job terminates after its retained frontier is exhausted.
 
 Coverage records whether GitHub pagination finished for followers, following, starred repositories, and owned repositories. If a collection hits the 300-entry cap while another page exists, its coverage is incomplete. The returned portion is merged with the prior cache, existing edges for that collection are not deleted, and the neighborhood remains `STALE`. A complete collection is authoritative and replaces its prior edges. Neo4j performs all collection updates in one transaction, so any failure rolls the import back.
 
@@ -123,7 +127,7 @@ The GraphQL explorer is additive. Existing health, auth, sync, bookmark, categor
 
 ## Current verification boundary
 
-- Rust tests cover GraphQL authentication/schema behavior, OAuth state validation across service replicas, authenticated-encryption tamper rejection, legacy identity-file encryption, canonical reconnects and browser logout, direction preservation, coverage-aware partial imports, bounded public-only imports, ranking, private saved-state isolation, freshness, transactional bookmark behavior, cancellation-safe in-process expansion deduplication, shared cross-instance leases, stale-token fencing, and embedded schema parsing/checksums.
+- Rust tests cover GraphQL authentication/schema behavior, OAuth state validation across service replicas, authenticated-encryption tamper rejection, legacy identity-file encryption, canonical reconnects and browser logout, direction preservation, coverage-aware partial imports, bounded public-only imports, ranking, private saved-state isolation, freshness, transactional bookmark behavior, cancellation-safe in-process expansion deduplication, shared cross-instance leases, stale-token fencing, warmup start deduplication/resume/reserve/isolation, and embedded schema parsing/checksums.
 - API-client tests cover GraphQL request construction.
-- Svelte checks and route utility tests cover the click-trail helpers and UI types.
+- React/Vite checks and route utility tests cover the click-trail helpers, compatibility redirects, and UI types.
 - Live Neo4j initialization and browser OAuth/GitHub API behavior still require a running Docker engine and valid GitHub credentials.

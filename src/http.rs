@@ -5,8 +5,9 @@ use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::{
         HeaderMap, Method, StatusCode,
-        header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE},
     },
+    middleware,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -52,9 +53,20 @@ pub fn router(state: Shared<AppState>) -> Router {
                 .allow_methods([Method::GET, Method::POST])
                 .allow_headers([CONTENT_TYPE]),
         )
+        .layer(middleware::map_response(private_no_store))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(Extension(schema))
         .with_state(state)
+}
+
+async fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        "private, no-store"
+            .parse()
+            .expect("static cache-control header"),
+    );
+    response
 }
 
 async fn health(State(state): State<Shared<AppState>>) -> impl IntoResponse {

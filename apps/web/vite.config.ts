@@ -1,21 +1,21 @@
+import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vitest/config';
-import tailwindcss from '@tailwindcss/vite';
-import { sveltekit } from '@sveltejs/kit/vite';
+
+const apiTarget = process.env.GITEXPLORE_DEV_API_BASE_URL ?? 'http://127.0.0.1:4000';
 
 export default defineConfig({
-	plugins: [tailwindcss(), sveltekit()],
-	test: {
-		expect: { requireAssertions: true },
-		projects: [
-			{
-				extends: './vite.config.ts',
-				test: {
-					name: 'server',
-					environment: 'node',
-					include: ['src/**/*.{test,spec}.{js,ts}'],
-					exclude: ['src/**/*.svelte.{test,spec}.{js,ts}']
-				}
-			}
-		]
-	}
+  plugins: [react()],
+  server: {
+    host: '0.0.0.0',
+    port: 3000,
+    proxy: Object.fromEntries(
+      ['/auth', '/graphql', '/health', '/sync', '/bookmarks', '/categories', '/explore'].map(
+        (path) => [path, { target: apiTarget, changeOrigin: false }],
+      ),
+    ),
+  },
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+  },
 });

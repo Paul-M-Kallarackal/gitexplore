@@ -1,10 +1,10 @@
 # UI Login and Session Flow
 
-This document is the source of truth for browser authentication between the SvelteKit frontend and Rust backend.
+This document is the source of truth for browser authentication between the React/Vite frontend and Rust backend.
 
 ## Implemented boundary
 
-- SvelteKit owns `/login` and the authenticated `/app` routes.
+- React Router owns `/login` and the authenticated `/app` routes in the browser.
 - Rust owns GitHub OAuth URL generation, one-time state and browser-nonce validation, callback exchange, canonical app-user identity resolution, and session creation.
 - The browser stores only the opaque `gitexplore_session` cookie. GitHub access tokens stay in the backend identity store.
 - Pending OAuth state is durable through the active identity repository, valid for 10 minutes, and bounded to 256 entries.
@@ -15,7 +15,7 @@ This document is the source of truth for browser authentication between the Svel
 
 ### 1. Load `/login`
 
-The root SvelteKit layout calls `GET /auth/status` through `packages/api_client`.
+The React application calls `GET /auth/status` through `packages/api_client` before resolving protected routes.
 
 - If the cookie resolves to a connected account, `/login` redirects to `/app`.
 - Otherwise the login page renders one GitHub connection action.
@@ -71,9 +71,9 @@ http://localhost:3000/app?connected=1
 
 ### 4. Protect `/app`
 
-The `/app` layout reads the parent auth result. If the account is not connected it redirects to `/login`; otherwise it loads private sync status and renders the application shell.
+The React auth boundary waits for the status query before resolving `/app`. If the account is not connected it redirects to `/login`; otherwise it renders the application shell and directs the index route to the Explore trailhead, prefilled with the connected account. A backend failure remains an explicit retryable error and is not treated as a logged-out response.
 
-Browser-side requests use `PUBLIC_GITEXPLORE_API_BASE_URL` with `credentials: "include"`. SvelteKit server-side loads use the private `GITEXPLORE_INTERNAL_API_BASE_URL`; `apps/web/src/hooks.server.ts` forwards `gitexplore_session` only when the target exactly matches that configured internal API origin. Docker Compose uses `http://gitexplore:4000` internally while the browser continues to use `http://localhost:4000`.
+Browser requests target the page origin and use `credentials: "include"`. During development, Vite proxies API paths to the Rust service; Docker Compose sets the server-only proxy target to `http://gitexplore:4000`. In production, Vercel routes those same paths to the Rust service under the single GitExplore origin. All frontend data loading happens in the browser, with no browser-exposed API-origin setting.
 
 ### 5. Sign out
 
@@ -89,17 +89,15 @@ A credential disconnect removes the connection and access token but retains the 
 
 ### 6. Enter the explorer
 
-`/app/explore` uses the connected GitHub login as the default starting point. `/app/explore/[login]` calls the cookie-authenticated GraphQL operations described in [Graph explorer and GraphQL](graph-explorer.md).
+`/app/explore` uses the connected GitHub login as the default starting point. `/app/explore/:login` calls the cookie-authenticated GraphQL operations described in [Graph explorer and GraphQL](graph-explorer.md).
+
+The authenticated shell has three primary areas: Explore, Saved, and Settings. Saved combines bookmarks, collections, and exploration history. Compatibility redirects map `/app/bookmarks`, `/app/categories`, and `/app/explore/snapshots` into the corresponding Saved view, and `/app/sync` into Settings.
 
 ## Relevant files
 
-- `apps/web/src/routes/login/+page.svelte`: login presentation and connect action
-- `apps/web/src/routes/login/+page.ts`: authenticated redirect and public runtime data
-- `apps/web/src/routes/+layout.server.ts`: root auth status
-- `apps/web/src/routes/app/+layout.server.ts`: authenticated app guard
-- `apps/web/src/routes/app/+layout.svelte`: application shell and browser logout action
-- `apps/web/src/lib/server/api.ts`: browser-visible and internal API base URL selection
-- `apps/web/src/hooks.server.ts`: same-API-origin session-cookie forwarding
+- `apps/web/src/`: React routes, authentication boundary, query state, and product composition
+- `apps/web/vite.config.ts`: development API proxy and browser-test configuration
+- `apps/web/vercel.json`: production SPA fallback
 - `packages/api_client/src/index.ts`: credentialed REST/GraphQL client and OAuth URL helper
 - `src/http.rs`: OAuth routes, cookie creation/resolution, CORS, GraphQL routing
 - `src/identity.rs` and `src/application.rs`: connection and session behavior
@@ -107,10 +105,9 @@ A credential disconnect removes the connection and access token but retains the 
 
 ## Required environment
 
-Frontend:
+Frontend development server (optional):
 
-- `PUBLIC_GITEXPLORE_API_BASE_URL`
-- `GITEXPLORE_INTERNAL_API_BASE_URL`
+- `GITEXPLORE_DEV_API_BASE_URL` (defaults to `http://127.0.0.1:4000`)
 
 Backend:
 
@@ -124,19 +121,17 @@ Backend:
 Default local values:
 
 ```dotenv
-PUBLIC_GITEXPLORE_API_BASE_URL=http://localhost:4000
-GITEXPLORE_INTERNAL_API_BASE_URL=http://localhost:4000
 GITEXPLORE_GITHUB_REDIRECT_URI=http://localhost:4000/auth/oauth/callback
 GITEXPLORE_GITHUB_SCOPES=read:user
 GITEXPLORE_FRONTEND_ORIGIN=http://localhost:3000
 GITEXPLORE_DATA_DIR=.gitexplore-data
 ```
 
-The callback URI must match the GitHub OAuth application registration exactly. `GITEXPLORE_INTERNAL_API_BASE_URL` falls back to the public value outside Compose; Compose overrides it with the Rust service URL.
+The callback URI must match the GitHub OAuth application registration exactly. Compose overrides the Vite proxy target with the Rust service URL inside its network. Production requires no client-side API base because the browser and API share one origin.
 
 ## UI contract
 
-The login and app surfaces consume the Svelte adapter over the consumed subset of the Strawn `0.1.0` semantic-token contract through `@gitexplore/ui/tokens.css`. Because Strawn's published components are React-based, GitExplore keeps product-specific, accessible Svelte components in `packages/ui` while treating the selected Strawn semantic variables as canonical. See [Graph explorer and GraphQL](graph-explorer.md#strawn-token-contract).
+The login and app surfaces consume components, semantic tokens, and icons directly from the public root entrypoints of `strawn` and `strawn-icons`. Product-specific route composition stays in `apps/web`; GitExplore does not maintain a parallel component library or token adapter. See [Graph explorer and GraphQL](graph-explorer.md#strawn-contract).
 
 ## Security and scope notes
 

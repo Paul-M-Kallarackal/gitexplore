@@ -142,6 +142,31 @@ export type GitHubRateLimit = {
   checkedAt: string;
 };
 
+export type DiscoveryWarmupStatus =
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'COMPLETED'
+  | 'RESERVE_PROTECTED'
+  | 'FAILED';
+
+export type DiscoveryWarmup = {
+  id: string;
+  seedLogin: string;
+  status: DiscoveryWarmupStatus;
+  currentLogin: string | null;
+  expandedUsers: number;
+  discoveredUsers: number;
+  pendingUsers: number;
+  frontierTruncated: boolean;
+  remainingRequests: number | null;
+  reserveRequests: number;
+  resetAt: string | null;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  lastError: string | null;
+};
+
 export type RepositoryContributor = {
   githubId: string;
   login: string;
@@ -402,6 +427,34 @@ export function createGitExploreApi(options: ApiClientOptions) {
         {}
       );
       return data.rateLimit;
+    },
+    getDiscoveryWarmup: async () => {
+      const data = await graphql<{ discoveryWarmup: DiscoveryWarmup | null }>(
+        `query DiscoveryWarmup {
+          discoveryWarmup {
+            id seedLogin status currentLogin
+            expandedUsers discoveredUsers pendingUsers frontierTruncated
+            remainingRequests reserveRequests resetAt
+            startedAt updatedAt completedAt lastError
+          }
+        }`,
+        {}
+      );
+      return data.discoveryWarmup;
+    },
+    startDiscoveryWarmup: async () => {
+      const data = await graphql<{ startDiscoveryWarmup: DiscoveryWarmup }>(
+        `mutation StartDiscoveryWarmup {
+          startDiscoveryWarmup {
+            id seedLogin status currentLogin
+            expandedUsers discoveredUsers pendingUsers frontierTruncated
+            remainingRequests reserveRequests resetAt
+            startedAt updatedAt completedAt lastError
+          }
+        }`,
+        {}
+      );
+      return data.startDiscoveryWarmup;
     },
     getRepositoryInsights: async (fullName: string, limit = 12) => {
       const data = await graphql<{

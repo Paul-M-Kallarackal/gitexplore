@@ -60,7 +60,7 @@ requireContract(
   'Ribbon and package.json must pin the same Strawn version and commit'
 );
 
-requireContract(vercel.services?.web?.framework === 'sveltekit', 'Vercel web service must use SvelteKit');
+requireContract(vercel.services?.web?.framework === 'vite', 'Vercel web service must use Vite');
 requireContract(
   vercel.git?.deploymentEnabled === false,
   'Automatic Vercel Git deployments must stay disabled; the protected release workflow owns production'
@@ -70,14 +70,12 @@ requireContract(
     vercel.services.api.runtime === 'container',
   'Vercel API service must use Dockerfile.vercel'
 );
+const webVercel = json('apps/web/vercel.json');
 requireContract(
-  vercel.services?.web?.bindings?.some(
-    (binding) =>
-      binding.type === 'service' &&
-      binding.service === 'api' &&
-      binding.env === 'GITEXPLORE_INTERNAL_API_BASE_URL'
+  webVercel.rewrites?.some(
+    (rewrite) => rewrite.source === '/(.*)' && rewrite.destination === '/index.html'
   ),
-  'Web service must have a private API service binding'
+  'Vite web service must rewrite browser routes to index.html'
 );
 for (const route of ['/auth/(.*)', '/graphql', '/health']) {
   requireContract(
@@ -85,10 +83,31 @@ for (const route of ['/auth/(.*)', '/graphql', '/health']) {
     `Vercel API rewrite missing for ${route}`
   );
 }
-for (const header of ['Strict-Transport-Security', 'X-Content-Type-Options', 'X-Frame-Options']) {
+for (const header of [
+  'Content-Security-Policy',
+  'Strict-Transport-Security',
+  'X-Content-Type-Options',
+  'X-Frame-Options',
+]) {
   requireContract(
     vercel.headers?.some((entry) => entry.headers?.some((item) => item.key === header)),
     `Security header ${header} is missing`
+  );
+}
+const contentSecurityPolicy = vercel.headers
+  ?.flatMap((entry) => entry.headers ?? [])
+  .find((item) => item.key === 'Content-Security-Policy')
+  ?.value;
+for (const directive of [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+  "script-src 'self'",
+]) {
+  requireContract(
+    contentSecurityPolicy?.includes(directive),
+    `Content-Security-Policy must contain: ${directive}`
   );
 }
 
@@ -123,8 +142,8 @@ for (const name of requiredServerEnv) {
   requireContract(manifest.runtimeEnvironment?.server?.includes(name), `Ribbon runtime contract is missing ${name}`);
 }
 requireContract(
-  manifest.runtimeEnvironment?.public?.includes('PUBLIC_GITEXPLORE_API_BASE_URL'),
-  'Ribbon runtime contract is missing the public API origin'
+  Array.isArray(manifest.runtimeEnvironment?.public) && manifest.runtimeEnvironment.public.length === 0,
+  'React/Vite must keep API routing same-origin without browser-exposed runtime variables'
 );
 
 requireContract(/push:\s*\n\s*branches:\s*\[main\]/.test(release), 'Release workflow must deploy only pushes to main');
@@ -132,6 +151,11 @@ requireContract(!/^\s*workflow_dispatch:/m.test(release), 'Release workflow must
 requireContract(release.includes('group: production-gitexplore'), 'Production deployments must share one concurrency group');
 requireContract(release.includes('pnpm exec vercel deploy --prebuilt --prod'), 'Release must deploy the verified prebuilt artifact');
 requireContract(release.includes('vercel inspect') && release.includes('--wait'), 'Release must wait for Vercel readiness');
+requireContract(
+  release.includes('playwright-1.61.1') &&
+    release.includes('pnpm production:smoke -- https://gitexplore.moriatz.com'),
+  'Release must boot the canonical React frontend with pinned, cached Playwright Chromium'
+);
 requireContract(
   release.includes('.graph_backend == "neo4j"') && release.includes('https://gitexplore.moriatz.com/health'),
   'Release must verify the canonical Neo4j-backed health endpoint'

@@ -1,12 +1,13 @@
 # GitExplore
 
-GitExplore is a Rust, Neo4j, and SvelteKit application for walking GitHub follower/following graphs and finding repositories with strong nearby signal before they become obvious. Public GitHub facts are shared in the graph; saves, categories, snapshots, sessions, and sync state remain private to the authenticated app user.
+GitExplore is a Rust, Neo4j, and React application for walking GitHub follower/following graphs and finding repositories with strong nearby signal before they become obvious. Public GitHub facts are shared in the graph; saves, categories, snapshots, sessions, and sync state remain private to the authenticated app user.
 
 The repository now also contains a `pnpm + Turborepo` UI workspace:
 
-- `apps/web`: SvelteKit dashboard UI
+- `apps/web`: React/Vite product UI
 - `packages/api_client`: typed HTTP client for the Rust API
-- `packages/ui`: product-owned Svelte components plus the Svelte adapter for GitExplore's consumed subset of Strawn `0.1.0` semantic tokens
+
+The web app consumes the canonical public `strawn` and `strawn-icons` package entrypoints. Product-specific graph, repository, and application-shell composition stays in `apps/web`; there is no product-local design-system package.
 
 The current graph-explorer slice provides:
 
@@ -16,7 +17,9 @@ The current graph-explorer slice provides:
 - public-only repository imports and private, idempotent repository saves
 - coverage-aware transactional Neo4j graph updates and constraint-backed bookmark uniqueness
 - stable numeric GitHub identity with normalized, rename-safe user and repository aliases
-- durable click trails at `/app/explore/[login]?trail=...`
+- refreshable, shareable click trails at `/app/explore/:login?trail=...`
+
+The primary application areas are Explore, Saved, and Settings. Saved combines bookmarks, collections, and exploration history. Compatibility redirects preserve the former `/app/bookmarks`, `/app/categories`, `/app/explore/snapshots`, and `/app/sync` URLs.
 
 See [Graph explorer and GraphQL](docs/graph-explorer.md) for the API operations, ranking contract, and frontend workflow.
 
@@ -81,15 +84,13 @@ Install workspace dependencies once:
 pnpm install
 ```
 
-Run the SvelteKit dashboard against the API:
+Run the React/Vite app against the API:
 
 ```bash
-$env:PUBLIC_GITEXPLORE_API_BASE_URL='http://localhost:4000'
-$env:GITEXPLORE_INTERNAL_API_BASE_URL='http://localhost:4000'
 pnpm --filter @gitexplore/web dev
 ```
 
-`PUBLIC_GITEXPLORE_API_BASE_URL` is the browser-visible API origin. Server-side SvelteKit requests use `GITEXPLORE_INTERNAL_API_BASE_URL`, falling back to the public value when it is unset. Docker Compose sets the internal URL to `http://gitexplore:4000` while browsers continue to use `http://localhost:4000`.
+During local development, Vite proxies `/auth`, `/graphql`, `/health`, `/sync`, `/bookmarks`, `/categories`, and `/explore` to `http://127.0.0.1:4000` by default. Set the server-only `GITEXPLORE_DEV_API_BASE_URL` in the Vite process when the API is elsewhere. Docker Compose sets it to `http://gitexplore:4000`, while the browser continues to target its own `http://localhost:3000` origin. Production routes those same paths to the Rust service under the single deployed origin.
 
 Run the Rust API locally with file storage:
 

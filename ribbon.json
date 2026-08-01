@@ -3,7 +3,7 @@
   "name": "GitExplore",
   "slug": "gitexplore",
   "description": "A fast, authenticated GitHub social and repository graph explorer.",
-  "framework": "sveltekit-rust-services",
+  "framework": "react-vite-rust-services",
   "projectType": "application",
   "providers": {
     "deployment": {
@@ -52,16 +52,13 @@
     },
     "designSystem": {
       "provider": "strawn",
-      "source": "repository-pin",
-      "version": "0.1.0",
-      "commit": "7c4bc3421f41cfd91aaa970c2066e8382853d3da",
-      "integration": "semantic-token-snapshot"
+      "source": "npm",
+      "version": "0.2.0",
+      "packages": ["strawn", "strawn-icons"]
     }
   },
   "runtimeEnvironment": {
-    "public": [
-      "PUBLIC_GITEXPLORE_API_BASE_URL"
-    ],
+    "public": [],
     "server": [
       "GITEXPLORE_FRONTEND_ORIGIN",
       "GITEXPLORE_GITHUB_CLIENT_ID",

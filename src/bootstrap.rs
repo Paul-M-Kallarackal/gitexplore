@@ -100,6 +100,7 @@ pub async fn build_app_state(config: AppConfig) -> AppResult<AppState> {
             )
         }
     };
+    services.discovery.resume_warmups().await?;
 
     Ok(AppState {
         services,

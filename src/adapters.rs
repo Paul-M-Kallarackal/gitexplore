@@ -31,18 +31,18 @@ use crate::{
     },
     exploration::{ExplorationResult, ExplorationSeed, ExplorationSnapshot},
     graph::{
-        CacheMetadata, CacheStatus, GitHubRateLimitLease, GitHubRateLimitStatus,
-        GitHubRepositoryNode, GitHubUserNode, GraphImport, GraphImportCoverage, RefreshJobStatus,
-        RefreshLease, RefreshLeaseAttempt, RefreshLeaseState, RefreshLeaseStatus, SyncStatus,
-        SyncSummary, UserRefreshOutcome,
+        CacheMetadata, CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus,
+        GitHubRateLimitLease, GitHubRateLimitStatus, GitHubRepositoryNode, GitHubUserNode,
+        GraphImport, GraphImportCoverage, RefreshJobStatus, RefreshLease, RefreshLeaseAttempt,
+        RefreshLeaseState, RefreshLeaseStatus, SyncStatus, SyncSummary, UserRefreshOutcome,
     },
     identity::{ConnectedAccount, GitHubConnection, PendingBrowserLogin},
     insights::{
         INSIGHT_REFRESH_RETRY_MINUTES, INSIGHT_REFRESH_TIMEOUT_MINUTES,
         REPOSITORY_CONTRIBUTOR_LIMIT, RepositoryContributor, RepositoryContributorInsights,
         RepositoryContributorsSnapshot, USER_COMMIT_ACTIVITY_EVENT_LIMIT,
-        UserCommitRepositoriesSnapshot, UserCommitRepository, UserCommitRepositoryInsights,
-        refresh_is_active,
+        USER_COMMIT_ACTIVITY_WINDOW_DAYS, UserCommitRepositoriesSnapshot, UserCommitRepository,
+        UserCommitRepositoryInsights, refresh_is_active,
     },
     ports::{
         BookmarkRepository, CategoryRepository, DeviceLoginStart, DiscoveryRepository,
@@ -605,6 +605,8 @@ struct SharedGraphStore {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct GraphStore {
     sync_status: HashMap<String, SyncStatus>,
+    #[serde(default)]
+    discovery_warmups: HashMap<String, DiscoveryWarmupJob>,
     shared: SharedGraphStore,
     categories: HashMap<String, Vec<Category>>,
     bookmarks: HashMap<String, Vec<Bookmark>>,
@@ -1284,6 +1286,89 @@ impl SyncStateRepository for LocalSyncStateRepository {
         let mut guard = self.store.lock()?;
         guard.sync_status.insert(user_id.to_string(), status);
         self.store.persist(&guard)
+    }
+
+    async fn start_discovery_warmup(
+        &self,
+        user_id: &str,
+        initial: DiscoveryWarmupJob,
+    ) -> AppResult<DiscoveryWarmupJob> {
+        let mut guard = self.store.lock()?;
+        if let Some(existing) = guard.discovery_warmups.get(user_id)
+            && existing.status != DiscoveryWarmupStatus::Failed
+        {
+            return Ok(existing.clone());
+        }
+        guard
+            .discovery_warmups
+            .insert(user_id.to_string(), initial.clone());
+        self.store.persist(&guard)?;
+        Ok(initial)
+    }
+
+    async fn resume_discovery_warmup_after_reset(
+        &self,
+        user_id: &str,
+        resumed: DiscoveryWarmupJob,
+    ) -> AppResult<DiscoveryWarmupJob> {
+        let mut guard = self.store.lock()?;
+        let should_resume = guard
+            .discovery_warmups
+            .get(user_id)
+            .is_some_and(|existing| {
+                existing.id == resumed.id
+                    && existing.status == DiscoveryWarmupStatus::ReserveProtected
+                    && existing
+                        .reset_at
+                        .is_some_and(|reset_at| reset_at <= Utc::now())
+            });
+        if should_resume {
+            guard
+                .discovery_warmups
+                .insert(user_id.to_string(), resumed.clone());
+            self.store.persist(&guard)?;
+            return Ok(resumed);
+        }
+        guard
+            .discovery_warmups
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Storage("discovery warmup disappeared while resuming".to_string())
+            })
+    }
+
+    async fn discovery_warmup(&self, user_id: &str) -> AppResult<Option<DiscoveryWarmupJob>> {
+        Ok(self.store.lock()?.discovery_warmups.get(user_id).cloned())
+    }
+
+    async fn runnable_discovery_warmups(&self, limit: usize) -> AppResult<Vec<String>> {
+        let mut warmups = self
+            .store
+            .lock()?
+            .discovery_warmups
+            .iter()
+            .filter(|(_, warmup)| warmup.status.is_runnable())
+            .map(|(user_id, warmup)| (warmup.updated_at, user_id.clone()))
+            .collect::<Vec<_>>();
+        warmups.sort();
+        Ok(warmups
+            .into_iter()
+            .take(limit)
+            .map(|(_, user_id)| user_id)
+            .collect())
+    }
+
+    async fn save_discovery_warmup_under_lease(
+        &self,
+        user_id: &str,
+        warmup: DiscoveryWarmupJob,
+        _lease: &RefreshLease,
+    ) -> AppResult<bool> {
+        let mut guard = self.store.lock()?;
+        guard.discovery_warmups.insert(user_id.to_string(), warmup);
+        self.store.persist(&guard)?;
+        Ok(true)
     }
 }
 
@@ -2792,7 +2877,11 @@ impl GitHubClientPort for OctocrabGitHubClient {
             .await
             .map_err(|error| AppError::External(error.to_string()))?;
         let events = Self::bounded_pages(&crab, page, USER_COMMIT_ACTIVITY_EVENT_LIMIT).await?;
-        Ok(aggregate_user_commit_events(events.items, events.complete))
+        Ok(aggregate_user_commit_events(
+            events.items,
+            events.complete,
+            Utc::now(),
+        ))
     }
 
     fn browser_oauth_url(&self, config: &GitHubAuthConfig, state: &str) -> AppResult<String> {
@@ -4596,6 +4685,209 @@ impl SyncStateRepository for Neo4jSyncStateRepository {
             )
             .await
     }
+
+    async fn start_discovery_warmup(
+        &self,
+        user_id: &str,
+        initial: DiscoveryWarmupJob,
+    ) -> AppResult<DiscoveryWarmupJob> {
+        let initial_json = serde_json::to_string(&initial)?;
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MERGE (sync:SyncState {user_id: $user_id})
+                     SET sync.state = coalesce(sync.state, 'NeverSynced'),
+                         sync.discovery_warmup_mutex = coalesce(sync.discovery_warmup_mutex, 0) + 1
+                     WITH sync,
+                          sync.discovery_warmup_status IS NULL
+                            OR sync.discovery_warmup_status = 'failed' AS should_start
+                     FOREACH (_ IN CASE WHEN should_start THEN [1] ELSE [] END |
+                       SET sync.discovery_warmup_status = 'queued',
+                           sync.discovery_warmup_id = $warmup_id,
+                           sync.discovery_warmup_reset_at = null,
+                           sync.discovery_warmup_updated_at = datetime($updated_at),
+                           sync.discovery_warmup_json = $initial_json
+                     )
+                     RETURN sync.discovery_warmup_json AS warmup_json",
+                )
+                .param("user_id", user_id.to_string())
+                .param("warmup_id", initial.id.clone())
+                .param("updated_at", initial.updated_at.to_rfc3339())
+                .param("initial_json", initial_json),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+            .ok_or_else(|| AppError::Storage("warmup start query returned no row".to_string()))?;
+        let state_json = row.get::<String>("warmup_json").map_err(map_neo4j_decode)?;
+        serde_json::from_str(&state_json).map_err(Into::into)
+    }
+
+    async fn resume_discovery_warmup_after_reset(
+        &self,
+        user_id: &str,
+        resumed: DiscoveryWarmupJob,
+    ) -> AppResult<DiscoveryWarmupJob> {
+        let resumed_json = serde_json::to_string(&resumed)?;
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (sync:SyncState {user_id: $user_id})
+                     SET sync.discovery_warmup_mutex = coalesce(sync.discovery_warmup_mutex, 0) + 1
+                     WITH sync,
+                          sync.discovery_warmup_status = 'reserve_protected'
+                            AND sync.discovery_warmup_id = $warmup_id
+                            AND coalesce(sync.discovery_warmup_reset_at <= datetime(), false)
+                            AS should_resume
+                     FOREACH (_ IN CASE WHEN should_resume THEN [1] ELSE [] END |
+                       SET sync.discovery_warmup_status = 'queued',
+                           sync.discovery_warmup_reset_at = null,
+                           sync.discovery_warmup_updated_at = datetime($updated_at),
+                           sync.discovery_warmup_json = $resumed_json
+                     )
+                     RETURN sync.discovery_warmup_json AS warmup_json",
+                )
+                .param("user_id", user_id.to_string())
+                .param("warmup_id", resumed.id.clone())
+                .param("updated_at", resumed.updated_at.to_rfc3339())
+                .param("resumed_json", resumed_json),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+            .ok_or_else(|| AppError::Storage("warmup resume query returned no row".to_string()))?;
+        let state_json = row.get::<String>("warmup_json").map_err(map_neo4j_decode)?;
+        serde_json::from_str(&state_json).map_err(Into::into)
+    }
+
+    async fn discovery_warmup(&self, user_id: &str) -> AppResult<Option<DiscoveryWarmupJob>> {
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (sync:SyncState {user_id: $user_id})
+                     RETURN sync.discovery_warmup_json AS warmup_json
+                     LIMIT 1",
+                )
+                .param("user_id", user_id.to_string()),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        row.get::<Option<String>>("warmup_json")
+            .map_err(map_neo4j_decode)?
+            .map(|state_json| serde_json::from_str(&state_json).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn runnable_discovery_warmups(&self, limit: usize) -> AppResult<Vec<String>> {
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (sync:SyncState)
+                     WHERE sync.discovery_warmup_status IN ['queued', 'running']
+                       AND sync.discovery_warmup_json IS NOT NULL
+                     RETURN sync.user_id AS user_id
+                     ORDER BY sync.discovery_warmup_updated_at, sync.user_id
+                     LIMIT $limit",
+                )
+                .param("limit", i64::try_from(limit).unwrap_or(i64::MAX)),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let mut user_ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        {
+            user_ids.push(row.get::<String>("user_id").map_err(map_neo4j_decode)?);
+        }
+        Ok(user_ids)
+    }
+
+    async fn save_discovery_warmup_under_lease(
+        &self,
+        user_id: &str,
+        warmup: DiscoveryWarmupJob,
+        lease: &RefreshLease,
+    ) -> AppResult<bool> {
+        let status = warmup.status.as_str().to_string();
+        let warmup_id = warmup.id.clone();
+        let updated_at = warmup.updated_at.to_rfc3339();
+        let reset_at = warmup
+            .reset_at
+            .map(|reset_at| reset_at.to_rfc3339())
+            .unwrap_or_default();
+        let warmup_json = serde_json::to_string(&warmup)?;
+        let mut rows = self
+            .client
+            .graph
+            .execute_on(
+                &self.client.database,
+                query(
+                    "MATCH (lease:RefreshLease {entity_key: $entity_key}),
+                           (sync:SyncState {user_id: $user_id})
+                     SET lease.mutex = coalesce(lease.mutex, 0) + 1
+                     WITH lease, sync,
+                          lease.status = 'running'
+                            AND lease.token = $token
+                            AND lease.expires_at > datetime() AS valid
+                     FOREACH (_ IN CASE WHEN valid THEN [1] ELSE [] END |
+                       SET sync.discovery_warmup_status = $status,
+                           sync.discovery_warmup_id = $warmup_id,
+                           sync.discovery_warmup_updated_at = datetime($updated_at),
+                           sync.discovery_warmup_reset_at = CASE
+                             WHEN $reset_at = '' THEN null
+                             ELSE datetime($reset_at)
+                           END,
+                           sync.discovery_warmup_json = $warmup_json
+                     )
+                     RETURN valid AS updated",
+                )
+                .param("entity_key", lease.entity_key.clone())
+                .param("token", lease.token.clone())
+                .param("user_id", user_id.to_string())
+                .param("status", status)
+                .param("warmup_id", warmup_id)
+                .param("updated_at", updated_at)
+                .param("reset_at", reset_at)
+                .param("warmup_json", warmup_json),
+            )
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| AppError::External(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        row.get::<bool>("updated").map_err(map_neo4j_decode)
+    }
 }
 
 fn parse_sync_state(value: &str) -> crate::graph::SyncState {
@@ -6135,10 +6427,12 @@ struct GitHubPushPayload {
 fn aggregate_user_commit_events(
     events: Vec<GitHubPublicEvent>,
     source_complete: bool,
+    observed_at: DateTime<Utc>,
 ) -> UserCommitRepositoriesSnapshot {
     let source_event_count = events.len();
     let source_truncated =
         !source_complete || source_event_count == USER_COMMIT_ACTIVITY_EVENT_LIMIT;
+    let activity_cutoff = observed_at - Duration::days(i64::from(USER_COMMIT_ACTIVITY_WINDOW_DAYS));
     let mut repositories = HashMap::<String, UserCommitRepository>::new();
     for event in events {
         if event.kind != "PushEvent" {
@@ -6147,6 +6441,9 @@ fn aggregate_user_commit_events(
         let Some(created_at) = event.created_at else {
             continue;
         };
+        if created_at < activity_cutoff || created_at > observed_at {
+            continue;
+        }
         let commit_count = event.payload.size;
         repositories
             .entry(event.repository.name.clone())
@@ -6762,7 +7059,9 @@ mod tests {
 
     #[test]
     fn public_push_events_are_aggregated_by_repository_and_commit_count() {
-        let now = Utc::now();
+        let observed_at = "2026-07-01T12:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid observation time");
         let snapshot = aggregate_user_commit_events(
             vec![
                 GitHubPublicEvent {
@@ -6772,7 +7071,7 @@ mod tests {
                         name: "acme/tool".to_string(),
                     },
                     payload: GitHubPushPayload { size: 2 },
-                    created_at: Some(now - Duration::hours(2)),
+                    created_at: Some(observed_at - Duration::hours(2)),
                 },
                 GitHubPublicEvent {
                     kind: "WatchEvent".to_string(),
@@ -6781,7 +7080,7 @@ mod tests {
                         name: "acme/ignored".to_string(),
                     },
                     payload: GitHubPushPayload::default(),
-                    created_at: Some(now),
+                    created_at: Some(observed_at),
                 },
                 GitHubPublicEvent {
                     kind: "PushEvent".to_string(),
@@ -6790,10 +7089,11 @@ mod tests {
                         name: "acme/tool".to_string(),
                     },
                     payload: GitHubPushPayload { size: 3 },
-                    created_at: Some(now),
+                    created_at: Some(observed_at),
                 },
             ],
             true,
+            observed_at,
         );
 
         assert_eq!(snapshot.source_event_count, 3);
@@ -6801,7 +7101,63 @@ mod tests {
         assert_eq!(snapshot.repositories.len(), 1);
         assert_eq!(snapshot.repositories[0].push_count, 2);
         assert_eq!(snapshot.repositories[0].commit_count, 5);
-        assert_eq!(snapshot.repositories[0].last_pushed_at, now);
+        assert_eq!(snapshot.repositories[0].last_pushed_at, observed_at);
+    }
+
+    #[test]
+    fn public_push_events_are_limited_to_the_rolling_activity_window() {
+        let observed_at = "2026-07-01T12:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid observation time");
+        let cutoff = observed_at - Duration::days(i64::from(USER_COMMIT_ACTIVITY_WINDOW_DAYS));
+        let snapshot = aggregate_user_commit_events(
+            vec![
+                GitHubPublicEvent {
+                    kind: "PushEvent".to_string(),
+                    repository: GitHubEventRepository {
+                        id: 10,
+                        name: "acme/at-cutoff".to_string(),
+                    },
+                    payload: GitHubPushPayload { size: 2 },
+                    created_at: Some(cutoff),
+                },
+                GitHubPublicEvent {
+                    kind: "PushEvent".to_string(),
+                    repository: GitHubEventRepository {
+                        id: 11,
+                        name: "acme/before-cutoff".to_string(),
+                    },
+                    payload: GitHubPushPayload { size: 20 },
+                    created_at: Some(cutoff - Duration::seconds(1)),
+                },
+                GitHubPublicEvent {
+                    kind: "PushEvent".to_string(),
+                    repository: GitHubEventRepository {
+                        id: 12,
+                        name: "acme/at-observation".to_string(),
+                    },
+                    payload: GitHubPushPayload { size: 3 },
+                    created_at: Some(observed_at),
+                },
+                GitHubPublicEvent {
+                    kind: "PushEvent".to_string(),
+                    repository: GitHubEventRepository {
+                        id: 13,
+                        name: "acme/future".to_string(),
+                    },
+                    payload: GitHubPushPayload { size: 30 },
+                    created_at: Some(observed_at + Duration::seconds(1)),
+                },
+            ],
+            true,
+            observed_at,
+        );
+
+        assert_eq!(snapshot.source_event_count, 4);
+        assert!(!snapshot.source_truncated);
+        assert_eq!(snapshot.repositories.len(), 2);
+        assert_eq!(snapshot.repositories[0].full_name, "acme/at-observation");
+        assert_eq!(snapshot.repositories[1].full_name, "acme/at-cutoff");
     }
 
     #[tokio::test]

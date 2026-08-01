@@ -11,7 +11,5 @@ node_modules
 .turbo
 **/.turbo
 apps/web/node_modules
-apps/web/.svelte-kit
-apps/web/build
-**/.svelte-kit
+apps/web/dist
 **/.vercel

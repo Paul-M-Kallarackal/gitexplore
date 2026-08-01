@@ -2,7 +2,7 @@
 
 ## Architecture
 
-GitExplore imports a GitHub social and repository graph through a Rust service and exposes CLI, HTTP, and SvelteKit product surfaces.
+GitExplore imports a GitHub social and repository graph through a Rust service and exposes CLI, HTTP, and React product surfaces.
 
 Preserve the shared-cache/private-overlay model:
 
@@ -21,7 +21,7 @@ The current repository implements the shared graph, private overlay, cookie sess
 - `src/adapters.rs` implements file and Neo4j persistence.
 - `src/http.rs` owns the Axum HTTP/session surface.
 - `packages/api_client/` owns the typed browser client.
-- `apps/web/` owns the SvelteKit UI.
+- `apps/web/` owns the React/Vite UI and consumes public APIs from `strawn` and `strawn-icons`.
 - `docs/` is the architecture and runtime source of truth.
 
 ## Verification

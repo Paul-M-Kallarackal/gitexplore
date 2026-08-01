@@ -1,42 +1,43 @@
-# sv
+# GitExplore web
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
-
-## Creating a project
-
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv@0.16.1 create --template minimal --types ts --add tailwindcss="plugins:none" vitest="usages:unit" sveltekit-adapter="adapter:node" --no-download-check --no-install apps/web
-```
+The browser product is a React 19 single-page application built with Vite. It uses the typed `@gitexplore/api-client` and the public root exports from `strawn` and `strawn-icons`.
 
 ## Developing
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+Install the workspace from the repository root, then start the web app:
 
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+```bash
+pnpm install
+pnpm --filter @gitexplore/web dev
 ```
 
-## Building
+The app sends same-origin, credentialed requests. Vite proxies API paths to `http://127.0.0.1:4000` by default. To use another local API origin, configure the Vite server rather than exposing an API base URL to browser code:
 
-To create a production version of your app:
-
-```sh
-npm run build
+```powershell
+$env:GITEXPLORE_DEV_API_BASE_URL='http://localhost:4000'
+pnpm --filter @gitexplore/web dev
 ```
 
-You can preview the production build with `npm run preview`.
+Docker Compose supplies `http://gitexplore:4000` as that proxy target inside its network.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+## Product routes
+
+- `/login`: GitHub connection and session recovery
+- `/app/explore/:login?`: follower/following traversal and repository discovery
+- `/app/saved`: bookmarks, collections, and exploration history
+- `/app/settings`: sync, GitHub request budget, and account controls
+- `/app/repository/:owner/:repo`: deep-linkable repository detail
+
+The router redirects the former bookmarks, categories, snapshots, and sync URLs into the matching Saved or Settings view.
+
+## Verify and build
+
+```bash
+pnpm --filter @gitexplore/web check
+pnpm --filter @gitexplore/web test
+pnpm --filter @gitexplore/web build
+```
+
+Preview the built SPA with `pnpm --filter @gitexplore/web preview`.
+
+Production is released with the Rust service through the reviewed repository workflow; do not deploy this directory independently.
