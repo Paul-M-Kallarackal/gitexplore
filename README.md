@@ -1,6 +1,6 @@
 # GitExplore
 
-GitExplore is a Rust, Neo4j, and React application for walking GitHub follower/following graphs and finding repositories with strong nearby signal before they become obvious. Public GitHub facts are shared in the graph; saves, categories, snapshots, sessions, and sync state remain private to the authenticated app user.
+GitExplore is a Rust, Neo4j, and React application for walking GitHub follower/following graphs and finding repositories with strong nearby signal before they become obvious. Public GitHub facts are shared in the graph; saves, categories, recent trails, expedition progress, sessions, and sync state remain private to the authenticated app user.
 
 The repository now also contains a `pnpm + Turborepo` UI workspace:
 
@@ -17,7 +17,8 @@ The current graph-explorer slice provides:
 - public-only repository imports and private, idempotent repository saves
 - coverage-aware transactional Neo4j graph updates and constraint-backed bookmark uniqueness
 - stable numeric GitHub identity with normalized, rename-safe user and repository aliases
-- refreshable, shareable click trails at `/app/explore/:login?trail=...`
+- refreshable, shareable click trails at `/app/explore/:login?trail=...`, plus private Recent people restart points and persistent expedition rank
+- concurrent bounded GitHub collection fetching and batched Neo4j graph/contributor writes on cold nodes
 
 The primary application areas are Explore, Saved, and Settings. Saved combines bookmarks, collections, and exploration history. Compatibility redirects preserve the former `/app/bookmarks`, `/app/categories`, `/app/explore/snapshots`, and `/app/sync` URLs.
 

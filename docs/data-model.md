@@ -5,16 +5,16 @@ GitExplore uses one shared cache of public GitHub facts plus a private overlay f
 ```mermaid
 flowchart LR
     appUser["Authenticated app user"]
-    private["Private overlay\nconnection + session\nsync state\nbookmarks + categories\nexploration snapshots"]
+    private["Private overlay\nconnection + session\nsync state\nbookmarks + categories\nrecent trails + progress"]
     shared["Shared public graph\nGitHub users\nrepositories\nFOLLOWS\nSTARRED\nOWNS"]
 
     appUser --> private
-    private -. "saved projection only" .-> shared
+    private -. "saved and recent-person projections" .-> shared
 ```
 
 There is no per-user copy of a GitHub user or repository. A repository's `saved` value is derived by joining that shared repository to only the requesting app user's bookmarks.
 
-Browser connections are canonicalized by stable GitHub user id. Reconnecting the same GitHub account reuses its existing app-user id and private overlay. Connecting a different GitHub account does not overwrite the first account's bookmarks, categories, snapshots, or sync state. Disconnecting credentials removes the connection record but deliberately retains the stable account link, so a future reconnect can recover the canonical app-user id.
+Browser connections are canonicalized by stable GitHub user id. Reconnecting the same GitHub account reuses its existing app-user id and private overlay. Connecting a different GitHub account does not overwrite the first account's bookmarks, categories, snapshots, recent trails, expedition progress, or sync state. Disconnecting credentials removes the connection record but deliberately retains the stable account link, so a future reconnect can recover the canonical app-user id.
 
 `GitHubIdentity` also owns the last observed GitHub REST `core` status (`limit`, `used`, `remaining`, `reset_at`, and `observed_at`) plus an opaque, expiring rate-budget lease. The existing unique `github_user_id` constraint makes this state account-scoped and replica-safe without a new schema object. File identity storage persists the equivalent maps. The lease is fenced by token and renewed during long requests; only its current owner may renew or release it.
 
@@ -105,7 +105,7 @@ The shared graph does not use `LocalUser-[:OWNS_GRAPH]->User`. Public facts are 
 
 ```mermaid
 flowchart LR
-    local["LocalUser {id}"]
+    local["LocalUser {id, exploration_max_depth}"]
     category["Category {user_id, name}"]
     bookmark["Bookmark {id, user_id, target_kind,\ntarget_github_id, note, created_at}"]
     snapshot["ExplorationSnapshot {id, user_id, ...}"]
@@ -124,8 +124,11 @@ flowchart LR
     local -->|"SAVED_SNAPSHOT"| snapshot
     local -->|"HAS_GITHUB_IDENTITY"| identity
     local -->|"HAS_SESSION"| session
+    local -->|"RECENTLY_VIEWED {trail, direction,\nlast_viewed_at, visit_count, visible}"| user
     local -. "same id only; no stored relationship" .-> sync
 ```
+
+Recent-person history is a private relationship from `LocalUser` to the canonical shared `User`, so GitHub login renames keep the saved destination attached to its stable numeric identity. The relationship stores the latest bounded trail (at most eight stable GitHub user ids with canonical login fallbacks), connection direction, server timestamp, visit count, and explicit visibility. Before a route can increase progress, every hop must resolve in the shared graph and every adjacent pair must have a `FOLLOWS` relationship in either direction. Recording a visit preserves `visible = false` after the user removes that person; the profile's Add action is the only operation that makes it visible again. Writes retain the 50 most recently viewed visible relationships plus 50 hidden opt-out tombstones, so an older explicit removal cannot silently reappear after pruning. `LocalUser.exploration_max_depth` only increases and is independent of removal, so earned Trailhead/Scout/Pathfinder/Cartographer progress survives restarts and shallower routes. The file adapter stores the equivalent per-user records and maximum in `graph.json`.
 
 `SyncState` is keyed directly by `user_id`; the current adapter does not add a relationship from `LocalUser`. It also owns that app user's serialized discovery-warmup job and a separately queryable status. The private job contains its id, connected-account seed, deduplicated expanded/frontier logins, current login, reserve observation, timestamps, and bounded error. Expanded and pending logins share a 10,000-user total bound, chosen to keep one private job well below the 190,000-node production import boundary. Once that bound is reached, additional candidates set `frontierTruncated` and are not retained, so exhausting the retained frontier still terminates the job. Neo4j updates this state only while the caller owns the fenced `discovery-warmup:<user_id>` `RefreshLease`; public users, repositories, and relationships discovered by the job still enter the shared graph.
 
@@ -199,10 +202,10 @@ Implemented:
 - durable, encrypted GitHub connections plus replica-safe OAuth state and browser sessions in Neo4j
 - durable per-identity GitHub REST status and fenced refresh-budget leases
 - private, durable discovery-warmup jobs with fenced resumable progress and shared public imports
+- private, bounded recent-person routes and monotonic expedition progress
 - coverage-aware transactional Neo4j collection replacement/merging and constraint-backed, transactional bookmark saves
 - compatibility reads for legacy `MEMBER_OF`
 
 Future work:
 
-- persisted private click history
 - general-purpose queued refresh and rate-budget scheduling beyond discovery warmup

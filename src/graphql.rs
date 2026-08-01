@@ -8,7 +8,10 @@ use async_graphql::{
 use crate::{
     bookmarks::{Bookmark, BookmarkTarget},
     bootstrap::AppState,
-    discovery::{DiscoveryRepositoryRecord, DiscoveryUser, RepositoryCandidate, UserNeighborhood},
+    discovery::{
+        DiscoveryRepositoryRecord, DiscoveryUser, ExplorationActivity, ExplorationDirection,
+        MAX_RECENT_PEOPLE, RecentPerson, RepositoryCandidate, UserNeighborhood,
+    },
     graph::{
         CacheStatus, DiscoveryWarmupJob, DiscoveryWarmupStatus, GitHubRateLimitStatus,
         GitHubRepositoryNode, GitHubUserNode, GraphImportCoverage,
@@ -54,18 +57,14 @@ impl QueryRoot {
         let user_id = request_user_id(context)?;
         let limit = repository_limit(limit)?;
         let state = context.data::<Shared<AppState>>()?;
-        let neighborhood = state
-            .services
-            .discovery
-            .user_neighborhood(user_id, &login)
-            .await
-            .map_err(graphql_error)?;
-        let repositories = state
-            .services
-            .discovery
-            .discover_repositories(user_id, &login, limit)
-            .await
-            .map_err(graphql_error)?;
+        let (neighborhood, repositories) = tokio::try_join!(
+            state.services.discovery.user_neighborhood(user_id, &login),
+            state
+                .services
+                .discovery
+                .discover_repositories(user_id, &login, limit),
+        )
+        .map_err(graphql_error)?;
         Ok(UserNeighborhoodObject::from_domain(
             neighborhood,
             repositories,
@@ -137,6 +136,24 @@ impl QueryRoot {
             .user_commit_repositories(user_id, &login, limit)
             .await
             .map(UserCommitRepositoryInsightsObject::from)
+            .map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 4)]
+    async fn exploration_activity(
+        &self,
+        context: &Context<'_>,
+        limit: i32,
+    ) -> GraphQlResult<ExplorationActivityObject> {
+        let user_id = request_user_id(context)?;
+        let limit = recent_people_limit(limit)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .discovery
+            .exploration_activity(user_id, limit)
+            .await
+            .map(ExplorationActivityObject::from)
             .map_err(graphql_error)
     }
 }
@@ -214,6 +231,67 @@ impl MutationRoot {
             .await
             .map_err(graphql_error)?;
         SavedRepositoryObject::try_from(bookmark).map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 6)]
+    async fn record_person_visit(
+        &self,
+        context: &Context<'_>,
+        login: String,
+        trail: Vec<String>,
+        direction: ExplorationDirectionObject,
+    ) -> GraphQlResult<ExplorationActivityObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .discovery
+            .record_person_visit(user_id, &login, trail, direction.into())
+            .await
+            .map(ExplorationActivityObject::from)
+            .map_err(graphql_error)
+    }
+
+    #[graphql(complexity = 6)]
+    async fn set_recent_person_visible(
+        &self,
+        context: &Context<'_>,
+        login: String,
+        visible: bool,
+    ) -> GraphQlResult<ExplorationActivityObject> {
+        let user_id = request_user_id(context)?;
+        let state = context.data::<Shared<AppState>>()?;
+        state
+            .services
+            .discovery
+            .set_recent_person_visible(user_id, &login, visible)
+            .await
+            .map(ExplorationActivityObject::from)
+            .map_err(graphql_error)
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+pub enum ExplorationDirectionObject {
+    Followers,
+    Following,
+}
+
+impl From<ExplorationDirectionObject> for ExplorationDirection {
+    fn from(value: ExplorationDirectionObject) -> Self {
+        match value {
+            ExplorationDirectionObject::Followers => Self::Followers,
+            ExplorationDirectionObject::Following => Self::Following,
+        }
+    }
+}
+
+impl From<ExplorationDirection> for ExplorationDirectionObject {
+    fn from(value: ExplorationDirection) -> Self {
+        match value {
+            ExplorationDirection::Followers => Self::Followers,
+            ExplorationDirection::Following => Self::Following,
+        }
     }
 }
 
@@ -436,6 +514,44 @@ pub struct GraphUserObject {
     pub bio: Option<String>,
     pub followers_count: Option<i32>,
     pub following_count: Option<i32>,
+}
+
+#[derive(SimpleObject)]
+pub struct RecentPersonObject {
+    pub user: GraphUserObject,
+    pub trail: Vec<String>,
+    pub direction: ExplorationDirectionObject,
+    pub last_viewed_at: String,
+    pub visit_count: i32,
+    pub visible: bool,
+}
+
+impl From<RecentPerson> for RecentPersonObject {
+    fn from(value: RecentPerson) -> Self {
+        Self {
+            user: value.profile.into(),
+            trail: value.trail,
+            direction: value.direction.into(),
+            last_viewed_at: value.last_viewed_at.to_rfc3339(),
+            visit_count: saturating_i32(value.visit_count),
+            visible: value.visible,
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct ExplorationActivityObject {
+    pub recent_people: Vec<RecentPersonObject>,
+    pub max_trail_depth: i32,
+}
+
+impl From<ExplorationActivity> for ExplorationActivityObject {
+    fn from(value: ExplorationActivity) -> Self {
+        Self {
+            recent_people: value.recent_people.into_iter().map(Into::into).collect(),
+            max_trail_depth: saturating_i32(value.max_trail_depth as u64),
+        }
+    }
 }
 
 impl From<GitHubUserNode> for GraphUserObject {
@@ -718,6 +834,15 @@ fn insight_limit(value: i32) -> GraphQlResult<usize> {
     Ok(value as usize)
 }
 
+fn recent_people_limit(value: i32) -> GraphQlResult<usize> {
+    if !(1..=i32::try_from(MAX_RECENT_PEOPLE).unwrap_or(i32::MAX)).contains(&value) {
+        return Err(Error::new(format!(
+            "recent people limit must be between 1 and {MAX_RECENT_PEOPLE}"
+        )));
+    }
+    Ok(value as usize)
+}
+
 fn saturating_i32(value: u64) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
@@ -804,6 +929,9 @@ mod tests {
         assert!(sdl.contains("enum DiscoveryWarmupStatusObject"));
         assert!(sdl.contains("repositoryInsights(fullName: String!, limit: Int!)"));
         assert!(sdl.contains("userInsights(login: String!, limit: Int!)"));
+        assert!(sdl.contains("explorationActivity(limit: Int!): ExplorationActivityObject!"));
+        assert!(sdl.contains("recordPersonVisit("));
+        assert!(sdl.contains("setRecentPersonVisible("));
     }
 
     #[test]

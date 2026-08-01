@@ -126,6 +126,28 @@ export type UserNeighborhood = {
   coverage: GraphCoverage;
 };
 
+export type ExplorationDirection = 'followers' | 'following';
+
+export type RecentPerson = {
+  user: GraphUser;
+  trail: string[];
+  direction: ExplorationDirection;
+  lastViewedAt: string;
+  visitCount: number;
+  visible: boolean;
+};
+
+export type ExplorationActivity = {
+  recentPeople: RecentPerson[];
+  maxTrailDepth: number;
+};
+
+type ExplorationActivityGraphQL = Omit<ExplorationActivity, 'recentPeople'> & {
+  recentPeople: Array<Omit<RecentPerson, 'direction'> & {
+    direction: 'FOLLOWERS' | 'FOLLOWING';
+  }>;
+};
+
 export type SavedRepository = {
   id: string;
   fullName: string;
@@ -494,6 +516,67 @@ export function createGitExploreApi(options: ApiClientOptions) {
       );
       return data.userInsights;
     },
+    getExplorationActivity: async (limit = 50) => {
+      const data = await graphql<{ explorationActivity: ExplorationActivityGraphQL }>(
+        `query ExplorationActivity($limit: Int!) {
+          explorationActivity(limit: $limit) {
+            recentPeople {
+              user { githubId login name url avatarUrl bio followersCount followingCount }
+              trail
+              direction
+              lastViewedAt
+              visitCount
+              visible
+            }
+            maxTrailDepth
+          }
+        }`,
+        { limit }
+      );
+      return normalizeExplorationActivity(data.explorationActivity);
+    },
+    recordPersonVisit: async (
+      login: string,
+      trail: string[],
+      direction: ExplorationDirection
+    ) => {
+      const data = await graphql<{ recordPersonVisit: ExplorationActivityGraphQL }>(
+        `mutation RecordPersonVisit($login: String!, $trail: [String!]!, $direction: ExplorationDirectionObject!) {
+          recordPersonVisit(login: $login, trail: $trail, direction: $direction) {
+            recentPeople {
+              user { githubId login name url avatarUrl bio followersCount followingCount }
+              trail
+              direction
+              lastViewedAt
+              visitCount
+              visible
+            }
+            maxTrailDepth
+          }
+        }`,
+        { login, trail, direction: direction.toUpperCase() }
+      );
+      return normalizeExplorationActivity(data.recordPersonVisit);
+    },
+    setRecentPersonVisible: async (login: string, visible: boolean) => {
+      const data = await graphql<{ setRecentPersonVisible: ExplorationActivityGraphQL }>(
+        `mutation SetRecentPersonVisible($login: String!, $visible: Boolean!) {
+          setRecentPersonVisible(login: $login, visible: $visible) {
+            recentPeople {
+              user { githubId login name url avatarUrl bio followersCount followingCount }
+              trail
+              direction
+              lastViewedAt
+              visitCount
+              visible
+            }
+            maxTrailDepth
+          }
+        }`,
+        { login, visible }
+      );
+      return normalizeExplorationActivity(data.setRecentPersonVisible);
+    },
     getNeighborhood: async (login: string, limit = 24) => {
       const data = await graphql<{ neighborhood: UserNeighborhood }>(
         `query Neighborhood($login: String!, $limit: Int!) {
@@ -577,6 +660,18 @@ export function createGitExploreApi(options: ApiClientOptions) {
       );
       return data.saveRepository;
     }
+  };
+}
+
+function normalizeExplorationActivity(
+  activity: ExplorationActivityGraphQL
+): ExplorationActivity {
+  return {
+    ...activity,
+    recentPeople: activity.recentPeople.map((person) => ({
+      ...person,
+      direction: person.direction === 'FOLLOWING' ? 'following' : 'followers'
+    }))
   };
 }
 

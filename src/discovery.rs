@@ -5,6 +5,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{CacheStatus, GitHubRepositoryNode, GitHubUserNode, GraphImportCoverage};
 
+pub const MAX_RECENT_PEOPLE: usize = 50;
+pub const MAX_HIDDEN_RECENT_PEOPLE: usize = 50;
+pub const MAX_SAVED_TRAIL_ENTRIES: usize = 8;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplorationDirection {
+    Followers,
+    Following,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentPerson {
+    pub profile: GitHubUserNode,
+    pub trail: Vec<String>,
+    pub direction: ExplorationDirection,
+    pub last_viewed_at: DateTime<Utc>,
+    pub visit_count: u64,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExplorationActivity {
+    pub recent_people: Vec<RecentPerson>,
+    pub max_trail_depth: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryUser {
     pub profile: GitHubUserNode,
