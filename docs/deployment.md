@@ -8,9 +8,9 @@ This document describes the deployment scaffold. It does not claim that the prod
 
 `vercel.json` declares two services:
 
-- `web` builds the React/Vite single-page application. Top-level `/login` and `/app/*` rewrites select its `index.html` route, while the final catch-all serves normal web assets and root requests.
+- `web` builds the React/Vite single-page application. Top-level `/login` and `/app/*` rewrites select the service and set its runtime-visible request path to `/index.html`, while the final catch-all preserves normal web asset and root paths.
 - `api` builds `Dockerfile.vercel` as a Rust container and receives `/auth/*`, `/graphql`, `/health`, `/sync/*`, `/bookmarks`, `/categories`, and `/explore*`.
-- `apps/web/vercel.json` keeps the Vite app's standalone SPA fallback; Vercel Services additionally requires the top-level web-service route selection above.
+- `apps/web/vercel.json` keeps the Vite app's standalone SPA fallback. In Services mode that nested file is not the public router, so the top-level request-path transforms above own direct React entry points.
 
 The linked Vercel project's Framework Preset must be set to **Services**. Vercel only activates this topology when that project setting and the top-level `services` configuration are both present. Automatic Vercel Git deployments are disabled in `vercel.json`; the protected, main-only release workflow owns production builds and domain updates.
 
