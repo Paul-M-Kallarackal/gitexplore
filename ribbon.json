@@ -1,0 +1,90 @@
+{
+  "manifestVersion": 2,
+  "name": "GitExplore",
+  "slug": "gitexplore",
+  "description": "A fast, authenticated GitHub social and repository graph explorer.",
+  "framework": "sveltekit-rust-services",
+  "projectType": "application",
+  "providers": {
+    "deployment": {
+      "provider": "vercel",
+      "mode": "services",
+      "projectName": "gitexplore",
+      "hostname": "gitexplore.moriatz.com",
+      "cnameTarget": "7f022f9bfa96016e.vercel-dns-017.com",
+      "cnameTargetVerification": "vercel-domain-inspected"
+    },
+    "backend": {
+      "provider": "rust-axum",
+      "runtime": "container",
+      "entrypoint": "Dockerfile.vercel",
+      "identityStore": {
+        "provider": "neo4j",
+        "productionReady": true,
+        "encryption": {
+          "algorithm": "xchacha20-poly1305",
+          "keyEnvironmentVariable": "GITEXPLORE_IDENTITY_ENCRYPTION_KEY",
+          "required": true
+        },
+        "durableOAuthState": true,
+        "durableSessions": true
+      },
+      "refreshCoordination": {
+        "provider": "neo4j-lease",
+        "productionReady": true,
+        "leaseSeconds": 300
+      }
+    },
+    "graph": {
+      "provider": "neo4j-aura",
+      "schema": "docker/neo4j/init/01-schema.cypher",
+      "migrationMode": "release-gated-idempotent-cli"
+    },
+    "auth": {
+      "provider": "github-oauth",
+      "callbackPath": "/auth/oauth/callback"
+    },
+    "dns": {
+      "provider": "hostinger",
+      "domain": "moriatz.com",
+      "hostname": "gitexplore.moriatz.com",
+      "ttl": 300
+    },
+    "designSystem": {
+      "provider": "strawn",
+      "source": "repository-pin",
+      "version": "0.1.0",
+      "commit": "7c4bc3421f41cfd91aaa970c2066e8382853d3da",
+      "integration": "semantic-token-snapshot"
+    }
+  },
+  "runtimeEnvironment": {
+    "public": [
+      "PUBLIC_GITEXPLORE_API_BASE_URL"
+    ],
+    "server": [
+      "GITEXPLORE_FRONTEND_ORIGIN",
+      "GITEXPLORE_GITHUB_CLIENT_ID",
+      "GITEXPLORE_GITHUB_CLIENT_SECRET",
+      "GITEXPLORE_GITHUB_REDIRECT_URI",
+      "GITEXPLORE_GITHUB_SCOPES",
+      "GITEXPLORE_GRAPH_BACKEND",
+      "GITEXPLORE_DEPLOYMENT_MODE",
+      "GITEXPLORE_IDENTITY_ENCRYPTION_KEY",
+      "GITEXPLORE_NEO4J_URI",
+      "GITEXPLORE_NEO4J_USERNAME",
+      "GITEXPLORE_NEO4J_PASSWORD",
+      "GITEXPLORE_NEO4J_DATABASE",
+      "GITEXPLORE_NEO4J_MAX_TOTAL_NODES",
+      "GITEXPLORE_NEO4J_MAX_TOTAL_RELATIONSHIPS"
+    ]
+  },
+  "urls": {
+    "local": "http://localhost:3000"
+  },
+  "status": "local",
+  "productionReadiness": {
+    "ready": true,
+    "blockers": []
+  }
+}

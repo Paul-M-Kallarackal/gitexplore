@@ -1,0 +1,23 @@
+{
+  "name": "gitexplore-workspace",
+  "private": true,
+  "designSystem": {
+    "package": "strawn",
+    "version": "0.1.0",
+    "source": "../../../../strawn",
+    "commit": "7c4bc3421f41cfd91aaa970c2066e8382853d3da"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "test": "turbo test",
+    "lint": "turbo lint",
+    "check": "turbo check",
+    "production:check": "node .github/scripts/verify-production-contract.mjs"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.8",
+    "vercel": "56.3.1"
+  }
+}

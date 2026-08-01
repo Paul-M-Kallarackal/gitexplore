@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: production-gitexplore
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Verify and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Restore Rust toolchain and dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/1.91.0-x86_64-unknown-linux-gnu
+            ~/.rustup/update-hashes/1.91.0-x86_64-unknown-linux-gnu
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify Rust service
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Verify browser packages
+        run: |
+          pnpm --filter @gitexplore/api-client test
+          pnpm --filter @gitexplore/web check
+          pnpm --filter @gitexplore/web test
+          pnpm check
+
+      - name: Enforce production contract
+        run: pnpm production:check
+
+      - name: Enforce declared production readiness
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+
+          const { productionReadiness: readiness } = JSON.parse(
+            readFileSync('ribbon.json', 'utf8')
+          );
+          const blockers = readiness?.blockers ?? [];
+          if (readiness?.ready !== true || blockers.length !== 0) {
+            console.error(`Release blocked: ${blockers.join(', ') || 'production readiness is false'}`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Apply and verify Neo4j Aura schema
+        run: |
+          cargo run --locked --release -- --format json schema apply
+          cargo run --locked --release -- --format json schema check
+        env:
+          GITEXPLORE_GRAPH_BACKEND: neo4j
+          GITEXPLORE_IDENTITY_ENCRYPTION_KEY: ${{ secrets.GITEXPLORE_IDENTITY_ENCRYPTION_KEY }}
+          GITEXPLORE_NEO4J_URI: ${{ secrets.GITEXPLORE_NEO4J_URI }}
+          GITEXPLORE_NEO4J_USERNAME: ${{ secrets.GITEXPLORE_NEO4J_USERNAME }}
+          GITEXPLORE_NEO4J_PASSWORD: ${{ secrets.GITEXPLORE_NEO4J_PASSWORD }}
+          GITEXPLORE_NEO4J_DATABASE: ${{ vars.GITEXPLORE_NEO4J_DATABASE || 'neo4j' }}
+
+      - name: Pull Vercel production settings
+        run: pnpm exec vercel pull --yes --environment=production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Build production artifact once
+        run: pnpm exec vercel build --prod
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Deploy verified artifact
+        id: deploy
+        shell: bash
+        run: echo "url=$(pnpm exec vercel deploy --prebuilt --prod)" >> "$GITHUB_OUTPUT"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Wait for Vercel readiness
+        run: pnpm exec vercel inspect "${{ steps.deploy.outputs.url }}" --wait --timeout=10m
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Assign custom domain
+        shell: bash
+        run: |
+          domains="$(pnpm exec vercel api "/v9/projects/${VERCEL_PROJECT_ID}/domains?teamId=${VERCEL_ORG_ID}" --raw)"
+          if jq -e --arg domain "gitexplore.moriatz.com" '.domains[] | select(.name == $domain)' <<<"$domains" >/dev/null; then
+            echo "gitexplore.moriatz.com is already assigned"
+          else
+            pnpm exec vercel api "/v10/projects/${VERCEL_PROJECT_ID}/domains?teamId=${VERCEL_ORG_ID}" -X POST -f name="gitexplore.moriatz.com"
+          fi
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Verify canonical DNS, TLS, API, frontend, and security headers
+        shell: bash
+        run: |
+          health=''
+          for _attempt in $(seq 1 60); do
+            health="$(curl --fail --silent --show-error --max-time 15 https://gitexplore.moriatz.com/health || true)"
+            if jq -e '.status == "ok" and .graph_backend == "neo4j"' <<<"$health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          jq -e '.status == "ok" and .graph_backend == "neo4j"' <<<"$health" >/dev/null
+
+          auth_status="$(curl --fail --silent --show-error --max-time 15 https://gitexplore.moriatz.com/auth/status)"
+          jq -e '.authenticated == false and .app_user_id == null' <<<"$auth_status" >/dev/null
+          graphql="$(curl --fail --silent --show-error --max-time 15 \
+            --header 'Content-Type: application/json' \
+            --header 'Origin: https://gitexplore.moriatz.com' \
+            --data '{"query":"{ apiVersion }"}' \
+            https://gitexplore.moriatz.com/graphql)"
+          jq -e '.data.apiVersion | type == "string" and length > 0' <<<"$graphql" >/dev/null
+          landing="$(curl --fail --silent --show-error --max-time 15 https://gitexplore.moriatz.com/login)"
+          grep -q 'https://gitexplore.moriatz.com' <<<"$landing"
+          if grep -q 'http://localhost:4000' <<<"$landing"; then
+            echo 'Production page contains the local API fallback' >&2
+            exit 1
+          fi
+
+          headers="$(curl --fail --silent --show-error --head --max-time 15 https://gitexplore.moriatz.com/)"
+          grep -qi '^strict-transport-security: max-age=31536000' <<<"$headers"
+          grep -qi '^x-content-type-options: nosniff' <<<"$headers"
+          grep -qi '^x-frame-options: DENY' <<<"$headers"
+
+      - name: Publish deployment metadata
+        shell: bash
+        run: |
+          printf '{"project":"gitexplore","url":"%s","commit":"%s","provider":"vercel"}\n' \
+            "${{ steps.deploy.outputs.url }}" "${{ github.sha }}" > deployment.json
+          cat deployment.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployment-url
+          path: deployment.json
+          retention-days: 30

@@ -1,0 +1,38 @@
+{
+	"name": "@gitexplore/web",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev --host 0.0.0.0 --port 3000",
+		"build": "vite build",
+		"preview": "vite preview --host 0.0.0.0 --port 3000",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"lint": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"test:unit": "vitest",
+		"test": "npm run test:unit -- --run"
+	},
+	"dependencies": {
+		"@gitexplore/api-client": "workspace:*",
+		"@gitexplore/ui": "workspace:*",
+		"@tanstack/query-core": "^5.101.4",
+		"@tanstack/svelte-query": "latest",
+		"clsx": "latest",
+		"lucide-svelte": "latest",
+		"tailwind-merge": "latest"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-vercel": "^6.3.4",
+		"@sveltejs/kit": "^2.63.0",
+		"@sveltejs/vite-plugin-svelte": "^7.1.2",
+		"@tailwindcss/vite": "^4.3.0",
+		"svelte": "^5.56.1",
+		"svelte-check": "^4.6.0",
+		"tailwindcss": "^4.3.0",
+		"typescript": "^6.0.3",
+		"vite": "^8.0.16",
+		"vitest": "^4.1.8"
+	}
+}

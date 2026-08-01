@@ -1,0 +1,75 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "git": {
+    "deploymentEnabled": false
+  },
+  "services": {
+    "web": {
+      "root": "apps/web/",
+      "framework": "sveltekit",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "api",
+          "format": "url",
+          "env": "GITEXPLORE_INTERNAL_API_BASE_URL"
+        }
+      ]
+    },
+    "api": {
+      "root": ".",
+      "entrypoint": "Dockerfile.vercel",
+      "runtime": "container"
+    }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" },
+        { "key": "Strict-Transport-Security", "value": "max-age=31536000" }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/auth/(.*)",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/graphql",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/health",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/sync/(.*)",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/bookmarks",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/categories",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/explore/snapshots",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/explore",
+      "destination": { "service": "api" }
+    },
+    {
+      "source": "/(.*)",
+      "destination": { "service": "web" }
+    }
+  ]
+}

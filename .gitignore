@@ -1,0 +1,12 @@
+/target
+.env
+.env.*
+!.env.example
+.gitexplore-data/
+node_modules/
+.turbo/
+apps/web/.svelte-kit/
+apps/web/build/
+apps/web/.vercel/
+.vercel/
+.gitexplore-*.png

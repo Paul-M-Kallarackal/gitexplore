@@ -1,0 +1,17 @@
+target
+.git
+.gitignore
+.env
+.env.*
+.vercel
+.gitexplore-data
+docs
+node_modules
+**/node_modules
+.turbo
+**/.turbo
+apps/web/node_modules
+apps/web/.svelte-kit
+apps/web/build
+**/.svelte-kit
+**/.vercel

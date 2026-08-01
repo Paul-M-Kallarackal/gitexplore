@@ -1,0 +1,104 @@
+name: Populate graph
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_id:
+        description: Canonical GitExplore user id from the authenticated Aura identity
+        required: true
+        type: string
+      seed_login:
+        description: GitHub login whose following/follower frontier should seed the crawl
+        required: true
+        type: string
+      max_expansions:
+        description: Hard cap on public user neighborhoods imported in this run
+        required: true
+        default: "350"
+        type: string
+      max_discovered_nodes:
+        description: Aura Free safety cap for unique nodes observed by this run
+        required: true
+        default: "180000"
+        type: string
+
+concurrency:
+  group: graph-crawl-${{ inputs.user_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    if: github.ref == 'refs/heads/main'
+    name: Import public GitHub neighborhoods
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    environment: production
+    env:
+      CARGO_TERM_COLOR: always
+      CRAWL_USER_ID: ${{ inputs.user_id }}
+      CRAWL_SEED_LOGIN: ${{ inputs.seed_login }}
+      CRAWL_MAX_EXPANSIONS: ${{ inputs.max_expansions }}
+      CRAWL_MAX_DISCOVERED_NODES: ${{ inputs.max_discovered_nodes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Restore Rust toolchain and dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/1.91.0-x86_64-unknown-linux-gnu
+            ~/.rustup/update-hashes/1.91.0-x86_64-unknown-linux-gnu
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.91.0-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal
+
+      - name: Verify Aura schema
+        run: cargo run --locked --release --quiet -- --format json schema check
+        env:
+          GITEXPLORE_GRAPH_BACKEND: neo4j
+          GITEXPLORE_IDENTITY_ENCRYPTION_KEY: ${{ secrets.GITEXPLORE_IDENTITY_ENCRYPTION_KEY }}
+          GITEXPLORE_NEO4J_URI: ${{ secrets.GITEXPLORE_NEO4J_URI }}
+          GITEXPLORE_NEO4J_USERNAME: ${{ secrets.GITEXPLORE_NEO4J_USERNAME }}
+          GITEXPLORE_NEO4J_PASSWORD: ${{ secrets.GITEXPLORE_NEO4J_PASSWORD }}
+          GITEXPLORE_NEO4J_DATABASE: ${{ vars.GITEXPLORE_NEO4J_DATABASE || 'neo4j' }}
+          GITEXPLORE_NEO4J_MAX_TOTAL_NODES: "190000"
+          GITEXPLORE_NEO4J_MAX_TOTAL_RELATIONSHIPS: "380000"
+
+      - name: Populate graph down to the protected request reserve
+        run: |
+          cargo run --locked --release --quiet -- \
+            --user-id "$CRAWL_USER_ID" \
+            --format json \
+            graph crawl \
+            --login "$CRAWL_SEED_LOGIN" \
+            --request-reserve 1000 \
+            --max-expansions "$CRAWL_MAX_EXPANSIONS" \
+            --max-discovered-nodes "$CRAWL_MAX_DISCOVERED_NODES" \
+            | tee crawl-result.json
+        env:
+          GITEXPLORE_GRAPH_BACKEND: neo4j
+          GITEXPLORE_IDENTITY_ENCRYPTION_KEY: ${{ secrets.GITEXPLORE_IDENTITY_ENCRYPTION_KEY }}
+          GITEXPLORE_NEO4J_URI: ${{ secrets.GITEXPLORE_NEO4J_URI }}
+          GITEXPLORE_NEO4J_USERNAME: ${{ secrets.GITEXPLORE_NEO4J_USERNAME }}
+          GITEXPLORE_NEO4J_PASSWORD: ${{ secrets.GITEXPLORE_NEO4J_PASSWORD }}
+          GITEXPLORE_NEO4J_DATABASE: ${{ vars.GITEXPLORE_NEO4J_DATABASE || 'neo4j' }}
+          GITEXPLORE_NEO4J_MAX_TOTAL_NODES: "190000"
+          GITEXPLORE_NEO4J_MAX_TOTAL_RELATIONSHIPS: "380000"
+
+      - name: Preserve crawl summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graph-crawl-summary
+          path: crawl-result.json
+          if-no-files-found: warn
+          retention-days: 30
