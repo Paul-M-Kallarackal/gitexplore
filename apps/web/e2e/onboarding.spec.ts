@@ -143,6 +143,10 @@ test('connected user reaches a private first save through the onboarding trail',
   await mockGitExplore(page);
   await page.goto('/app/explore');
 
+  const wordmark = page.locator('.brand-wordmark').first();
+  await expect(wordmark).toBeVisible();
+  await expect.poll(() => wordmark.evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  await expect(page.getByRole('link', { name: 'GitExplore Explore' }).first().locator('svg')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Your first GitExplore trail' })).toBeVisible();
   expect((await new AxeBuilder({ page }).include('.onboarding-card').analyze()).violations).toEqual([]);
 

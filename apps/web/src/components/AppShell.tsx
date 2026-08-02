@@ -1,11 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link, NavLink, Outlet } from 'react-router-dom';
 import { Avatar, Badge, Progress } from 'strawn';
-import { BookmarkIcon, GitHubIcon, SearchIcon, SettingsIcon } from 'strawn-icons';
+import { BookmarkIcon, SearchIcon, SettingsIcon } from 'strawn-icons';
 
 import { api } from '../api';
 import { useAuth } from '../auth';
 import { OnboardingProvider } from '../onboarding';
+import { GitExploreWordmark } from './GitExploreWordmark';
 import { OnboardingChecklist, OnboardingCompletion } from './OnboardingChecklist';
 
 const navItems = [
@@ -33,8 +34,7 @@ function AppShellContent() {
       <a className="skip-link" href="#main-content">Skip to content</a>
       <aside className="app-rail">
         <Link className="wordmark" to="/app/explore" aria-label="GitExplore Explore">
-          <span className="wordmark-mark" aria-hidden="true"><GitHubIcon size={18} /></span>
-          <span>GitExplore</span>
+          <GitExploreWordmark />
         </Link>
         <nav className="primary-nav" aria-label="Primary">
           {navItems.map(({ to, label, icon: Icon }) => (
@@ -67,7 +67,7 @@ function AppShellContent() {
       </aside>
       <header className="mobile-header">
         <Link className="wordmark" to="/app/explore" aria-label="GitExplore Explore">
-          <span className="wordmark-mark" aria-hidden="true"><GitHubIcon size={17} /></span><span>GitExplore</span>
+          <GitExploreWordmark />
         </Link>
         {rateQuery.data ? <span className="numeric-caption">{rateQuery.data.remaining.toLocaleString()} requests</span> : null}
       </header>
