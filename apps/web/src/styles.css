@@ -582,9 +582,23 @@ a {
   gap: var(--space-2);
 }
 
-.primary-link.pending {
-  cursor: wait;
-  opacity: var(--effect-disabled-opacity);
+.github-connect-link {
+  border: var(--border-weight-subtle) solid var(--primary);
+  background: var(--surface);
+  color: var(--foreground);
+  transition: background-color var(--motion-duration-fast) var(--motion-ease-standard);
+}
+
+.github-connect-link:hover {
+  background: var(--muted);
+}
+
+.github-connect-link:active {
+  background: var(--surface-inset);
+}
+
+.github-connect-link:focus-visible {
+  outline-color: var(--foreground);
 }
 
 .secondary-link {
