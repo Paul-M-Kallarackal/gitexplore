@@ -67,11 +67,8 @@ export function LoginPage() {
 
           <div className="login-action">
             <a
-              className={`primary-link${loading ? ' pending' : ''}`}
-              href={loading ? undefined : api.startBrowserOAuth(returnUrl)}
-              aria-disabled={loading || undefined}
-              tabIndex={loading ? -1 : undefined}
-              onClick={loading ? (event) => event.preventDefault() : undefined}
+              className="primary-link github-connect-link"
+              href={api.startBrowserOAuth(returnUrl)}
             >
               <span><GitHubIcon aria-hidden="true" size={18} /> Continue with GitHub</span>
               <ArrowRightIcon aria-hidden="true" size={17} />
