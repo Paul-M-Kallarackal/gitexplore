@@ -4,6 +4,7 @@ import { ArrowRightIcon, BookmarkIcon, CircleAlertIcon, GitHubIcon, UsersIcon } 
 
 import { api } from '../api';
 import { useAuth } from '../auth';
+import { GitExploreWordmark } from '../components/GitExploreWordmark';
 import { useDocumentTitle } from '../useDocumentTitle';
 
 export function LoginPage() {
@@ -20,8 +21,7 @@ export function LoginPage() {
     <main className="login-page">
       <header className="login-header">
         <Link className="wordmark" to="/" aria-label="GitExplore home">
-          <span className="wordmark-mark" aria-hidden="true"><GitHubIcon size={18} /></span>
-          <span>GitExplore</span>
+          <GitExploreWordmark />
         </Link>
         <span>Public graph · private saves</span>
       </header>

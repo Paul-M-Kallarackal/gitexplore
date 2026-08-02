@@ -89,23 +89,22 @@ a {
   display: inline-flex;
   min-height: var(--control-hit-target);
   align-items: center;
-  gap: var(--space-3);
   color: var(--foreground);
-  font-family: var(--font-heading);
-  font-size: var(--type-size-lg);
-  font-weight: var(--type-weight-bold);
-  letter-spacing: var(--type-tracking-tight);
   text-decoration: none;
 }
 
-.wordmark-mark {
-  display: grid;
-  width: 2rem;
-  height: 2rem;
-  place-items: center;
-  border-radius: var(--radius-sm);
-  background: var(--primary);
-  color: var(--primary-foreground);
+.brand-wordmark {
+  display: block;
+  width: auto;
+  height: 2.25rem;
+  max-width: 100%;
+  object-fit: contain;
+  object-position: left center;
+  user-select: none;
+}
+
+.mobile-header .brand-wordmark {
+  height: 1.9rem;
 }
 
 .primary-nav {

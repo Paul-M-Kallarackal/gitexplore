@@ -24,6 +24,10 @@ describe('LoginPage', () => {
 
   it('does not activate OAuth while session status is pending', () => {
     render(<ThemeProvider><MemoryRouter><LoginPage /></MemoryRouter></ThemeProvider>);
+    expect(screen.getByRole('link', { name: 'GitExplore home' }).querySelector('img')).toHaveAttribute(
+      'src',
+      '/images/gitexplore-wordmark.png',
+    );
     const link = screen.getByText(/continue with github/i).closest('a');
     expect(link).not.toBeNull();
     expect(link).not.toHaveAttribute('href');
